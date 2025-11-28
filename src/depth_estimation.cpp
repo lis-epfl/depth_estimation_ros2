@@ -127,7 +127,7 @@ void DepthEstimation::InitializeRosParameters() {
   this->get_parameter("filter_disparity", filter_disparity_);
 
   if (verbose_) {
-      RCLCPP_INFO(this->get_logger(), "Verbose mode ENABLED: Publishing 2x2 Debug Grid.");
+      RCLCPP_INFO(this->get_logger(), "Verbose mode ENABLED: Publishing 2x4 Debug Grid (Left|Disparity).");
   }
 
   RCLCPP_INFO(this->get_logger(), "Execution Mode: %s", run_parallel_ ? "PARALLEL (Multi-stream)" : "SEQUENTIAL (Single-stream)");
@@ -192,8 +192,8 @@ void DepthEstimation::InitializeModel() {
     auto input_name_ptr = inspect_session.GetInputNameAllocated(i, allocator);
     input_node_names_.emplace_back(input_name_ptr.get());
     input_node_dims_.push_back(inspect_session.GetInputTypeInfo(i)
-                                   .GetTensorTypeAndShapeInfo()
-                                   .GetShape());
+                                     .GetTensorTypeAndShapeInfo()
+                                     .GetShape());
   }
 
   output_node_names_.clear();
@@ -470,14 +470,44 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
 
       // C. VIZ PREP (Only generated if verbose is active)
       if (verbose_) {
+          // 1. Prepare Disparity Visualization
+          cv::Mat disparity_vis;
           cv::Mat valid_mask = (disparity_map > 0.0f) & (disparity_map <= 128.0f);
           cv::Mat disparity_normalized;
           cv::normalize(disparity_map, disparity_normalized, 0, 255, cv::NORM_MINMAX, CV_8U, valid_mask);
-          cv::applyColorMap(disparity_normalized, res.display_image, cv::COLORMAP_JET);
+          cv::applyColorMap(disparity_normalized, disparity_vis, cv::COLORMAP_JET);
+
+          // Apply black background to invalid pixels
           cv::Mat display_mask;
           cv::bitwise_not(valid_mask, display_mask);
-          res.display_image.setTo(cv::Scalar(0, 0, 0), display_mask);
-          cv::putText(res.display_image, "Pair " + pair_str, cv::Point(10, 20), cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 255, 255), 1);
+          disparity_vis.setTo(cv::Scalar(0, 0, 0), display_mask);
+
+          // 2. Prepare Original Image Visualization
+          cv::Mat left_vis;
+          // Ensure it is 3-channel BGR for concatenation
+          if (rectified_left.channels() == 1) {
+              cv::cvtColor(rectified_left, left_vis, cv::COLOR_GRAY2BGR);
+          } else {
+              left_vis = rectified_left.clone();
+          }
+
+          // Ensure depth matches (convert to 8-bit if needed)
+          if (left_vis.depth() != CV_8U) {
+              left_vis.convertTo(left_vis, CV_8U);
+          }
+
+          // 3. Concatenate (Left Image | Disparity)
+          // This creates a wide image for this specific pair
+          cv::hconcat(left_vis, disparity_vis, res.display_image);
+
+          // 4. Overlay Text
+          std::string label = "Pair " + pair_str;
+          // Draw label on the top-left of the original image
+          cv::putText(res.display_image, label + " (RGB)", cv::Point(10, 30),
+                      cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+          // Draw label on the top-left of the disparity image (offset by width of left image)
+          cv::putText(res.display_image, label + " (Disp)", cv::Point(left_vis.cols + 10, 30),
+                      cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
       }
 
       // D. POINT CLOUD
@@ -550,13 +580,14 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
               if (!res.display_image.empty()) {
                   grid_images.push_back(res.display_image);
               } else {
-                  grid_images.push_back(cv::Mat::zeros(cv::Size(224, 224), CV_8UC3));
+                  // Fallback black image (approximating 2x width)
+                  grid_images.push_back(cv::Mat::zeros(cv::Size(448, 224), CV_8UC3));
               }
           }
       } else {
            if (verbose_) {
                report << "  [" << res.pair_name << "] FAILED\n";
-               grid_images.push_back(cv::Mat::zeros(cv::Size(224, 224), CV_8UC3));
+               grid_images.push_back(cv::Mat::zeros(cv::Size(448, 224), CV_8UC3));
            }
       }
   }
@@ -564,6 +595,7 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
   // 4. COMBINED GRID PUBLISH (Only if Verbose)
   if (verbose_ && grid_images.size() == 4) {
       cv::Mat top_row, bottom_row, grid_view;
+      // Because grid_images[i] is now [Left | Disp], this concatenates them to [Left0 | Disp0 | Left1 | Disp1]
       cv::hconcat(grid_images[0], grid_images[1], top_row);
       cv::hconcat(grid_images[2], grid_images[3], bottom_row);
       cv::vconcat(top_row, bottom_row, grid_view);

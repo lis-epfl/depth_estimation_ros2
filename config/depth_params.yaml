@@ -10,7 +10,7 @@ depth_estimation_node:
     transform_config_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/config/cam0_to_centroid.yaml"
 
     # Path to the ONNX model. Use an absolute path.
-    onnx_model_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/models/S2M2_S_160_160_v2_torch29.onnx"
+    onnx_model_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/models/S2M2_S_192_192_v2_torch29.onnx"
 
     # ONNX Runtime execution provider: "tensorrt", "cuda", or "cpu"
     execution_provider: "tensorrt"
@@ -26,7 +26,7 @@ depth_estimation_node:
     calibration_base_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/config"
 
     # The resolution folder to use. This should match the folder name suffix.
-    calibration_resolution: "160_160"
+    calibration_resolution: "192_192"
 
     # Whether to publish a single, combined point cloud.
     publish_combined_pointcloud: false
@@ -38,7 +38,7 @@ depth_estimation_node:
     pointcloud_frame_id: "world"
 
     # if true, only publish the points we are sure about for s2m2
-    filter_disparity: true
+    filter_disparity: false
 
     # if true then run with nvidia multi-stream; if false run sequentially
     run_parallel: true

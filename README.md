@@ -3,6 +3,8 @@
 A ROS 2 package for real-time stereo depth estimation using ONNX models (S2M2, Hitnet, CREStereo).
 This node processes a 4-camera concatenated stream into 3D point clouds using GPU acceleration (TensorRT/CUDA).
 
+![Calibration Visualization](imgs/disparity.gif)
+
 ## Features
 * **Multi-Model Support:** Switch between S2M2, Hitnet, and CREStereo architectures.
 * **Parallel Processing:** Option to run inference on multiple stereo pairs concurrently using NVIDIA Multi-Stream or sequentially.
