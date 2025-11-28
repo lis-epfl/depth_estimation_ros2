@@ -35,11 +35,7 @@ python3 `src/depth_estimation_ros2/scripts/download_models.py`
 ```
 
 ### 3. Setup Calibration Maps
-Copy generated calibration maps into:
-
-```
-`src/depth_estimation_ros2/config/final_maps_<RES>/`
-```
+Copy generated calibration maps into: `src/depth_estimation_ros2/config/final_maps_<RES>/` e.g. `final_maps_224_224`.
 
 ### 4. Build
 ```bash
