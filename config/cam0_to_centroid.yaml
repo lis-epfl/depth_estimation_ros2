@@ -1,0 +1,9 @@
+# Configuration for the transform from the cam0 frame to the centroid frame.
+transform:
+  # 4x4 Row-major homogeneous transformation matrix [R | t]
+  data: [
+    -0.70710678,  0.0,  0.70710678,  0.075,
+    -0.70710678,  0.0, -0.70710678, -0.075,
+     0.0,        -1.0,  0.0,         -0.02,
+     0.0,         0.0,  0.0,         1.0
+  ]

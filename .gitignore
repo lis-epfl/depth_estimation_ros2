@@ -1,0 +1,24 @@
+# ignore the calibration mappings
+config/final_maps_*
+
+# ignore the tensorrt engines of my own pc
+models/*A2000*
+
+# ignore all the models because they are too big for github and will be downloaded form somewhere else
+models
+
+# ignore temp files
+*~
+
+# ignore vim temp files
+*.swp
+*.swo
+*.swn
+
+# Runtime-python
+*.pyc
+
+.gitman
+.gitman.old
+
+html/

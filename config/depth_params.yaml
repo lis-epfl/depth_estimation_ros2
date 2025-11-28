@@ -1,0 +1,47 @@
+depth_estimation_node:
+  ros__parameters:
+    # Subscriber topic for the 4-in-1 concatenated compressed image
+    input_image_topic: "/oak_ffc_4p_driver_node/image_raw"
+
+    # if true use compressed image
+    use_compressed_image: false
+
+    # --- REQUIRED: Path to the transform config file. ---
+    transform_config_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/config/cam0_to_centroid.yaml"
+
+    # Path to the ONNX model. Use an absolute path.
+    onnx_model_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/models/S2M2_M_160_160_v2_torch29.onnx"
+
+    # ONNX Runtime execution provider: "tensorrt", "cuda", or "cpu"
+    execution_provider: "tensorrt"
+
+    # Type of the ONNX model: "hitnet" or "crestereo" or "s2m2"
+    model_type: "s2m2"
+
+    # List of stereo pairs to process
+    stereo_pairs: ["0_1", "1_2", "2_3", "3_0"]
+
+    # --- NEW: Dynamic Calibration Path Parameters ---
+    # Base path where all calibration folders (e.g., 'final_maps_120_160') are stored.
+    calibration_base_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/config"
+
+    # The resolution folder to use. This should match the folder name suffix.
+    calibration_resolution: "160_160"
+
+    # Whether to publish a single, combined point cloud.
+    publish_combined_pointcloud: false
+
+    # Topic for the combined point cloud.
+    combined_pointcloud_topic: "/depth/pointcloud/combined"
+
+    # The coordinate frame for the output point cloud(s).
+    pointcloud_frame_id: "world"
+
+    # if true, only publish the points we are sure about for s2m2
+    filter_disparity: true
+
+    # if true then run with nvidia multi-stream; if false run sequentially
+    run_parallel: true
+
+    # if true send depth images on ros2 topic and compute time in the terminal
+    verbose: true
