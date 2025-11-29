@@ -6,7 +6,7 @@ import urllib.request
 # --- CONFIGURATION ---
 # Replace with your actual username and release tag
 VERSION = "v1.0.0"
-BASE_URL = f"https://github.com/<YOUR_USERNAME>/depth_estimation_ros2/releases/download/{VERSION}/"
+BASE_URL = f"https://github.com/lis-epfl/depth_estimation_ros2/releases/download/{VERSION}/"
 
 # The specific S2M2 files you requested
 FILES_TO_DOWNLOAD = [
