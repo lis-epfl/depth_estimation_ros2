@@ -1,12 +1,20 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 def generate_launch_description():
     pkg_dir = get_package_share_directory('depth_estimation_ros2')
-
     params_file = os.path.join(pkg_dir, 'config', 'depth_omninxt_params.yaml')
+
+    # 1. Declare the argument
+    frame_id_arg = DeclareLaunchArgument(
+        'pointcloud_frame_id',
+        default_value='drone_centroid', # Default fallback
+        description='The frame ID to use for the published point cloud'
+    )
 
     depth_estimation_node = Node(
         package='depth_estimation_ros2',
@@ -14,19 +22,14 @@ def generate_launch_description():
         name='depth_estimation_node',
         output='screen',
         emulate_tty=True,
-        parameters=[params_file]
+        parameters=[
+            params_file,
+            # 2. Override the parameter with the launch configuration
+            {'pointcloud_frame_id': LaunchConfiguration('pointcloud_frame_id')}
+        ]
     )
 
-    # --- ADDED NODE ---
-    # Publishes a static transform from 'world' to 'base_link' at 0,0,0
-    # static_tf_publisher = Node(
-    #     package='tf2_ros',
-    #     executable='static_transform_publisher',
-    #     name='static_world_broadcaster',
-    #     arguments=['0', '0', '0', '0', '0', '0', 'world', 'drone_centroid']
-    # )
-
     return LaunchDescription([
-        # static_tf_publisher,  # Add the new node to the launch description
+        frame_id_arg,
         depth_estimation_node
     ])
