@@ -25,6 +25,7 @@ DepthEstimation::DepthEstimation(const rclcpp::NodeOptions &options)
     InitializeModel();
     InitializeCalibrationData();
     InitializeTransform();
+    InitializeLogging();
   } catch (const std::exception &e) {
     RCLCPP_FATAL(this->get_logger(), "Initialization failed: %s", e.what());
     rclcpp::shutdown();
@@ -40,6 +41,9 @@ DepthEstimation::DepthEstimation(const rclcpp::NodeOptions &options)
 }
 
 DepthEstimation::~DepthEstimation() {
+  if (timing_file_.is_open()) {
+    timing_file_.close();
+  }
   RCLCPP_INFO(this->get_logger(), "Shutting down Depth Estimation Node.");
 }
 
@@ -102,6 +106,9 @@ void DepthEstimation::DeclareRosParameters() {
   this->declare_parameter<std::string>("pointcloud_frame_id", "drone_centroid");
 
   this->declare_parameter<bool>("filter_disparity", false);
+
+  this->declare_parameter<bool>("logging.enabled", true);
+  this->declare_parameter<std::string>("logging.directory", "/tmp/depth_logs");
 }
 
 void DepthEstimation::InitializeRosParameters() {
@@ -126,6 +133,9 @@ void DepthEstimation::InitializeRosParameters() {
 
   this->get_parameter("filter_disparity", filter_disparity_);
 
+  this->get_parameter("logging.enabled", enable_logging_);
+  this->get_parameter("logging.directory", logging_directory_);
+
   if (verbose_) {
       RCLCPP_INFO(this->get_logger(), "Verbose mode ENABLED: Publishing 2x4 Debug Grid (Left|Disparity).");
   }
@@ -145,6 +155,57 @@ void DepthEstimation::InitializeRosParameters() {
   if (model_type_ == "s2m2" && filter_disparity_) {
       RCLCPP_INFO(this->get_logger(), "S2M2 Confidence & Occlusion filtering ENABLED.");
   }
+}
+
+void DepthEstimation::InitializeLogging() {
+  if (!enable_logging_) return;
+
+  try {
+    if (!std::filesystem::exists(logging_directory_)) {
+      std::filesystem::create_directories(logging_directory_);
+    }
+
+    std::string filename = logging_directory_ + "/depth_computation_times.csv";
+    timing_file_.open(filename);
+
+    if (!timing_file_.is_open()) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to open logging file: %s", filename.c_str());
+      return;
+    }
+
+    // Write Header
+    timing_file_ << "timestamp,preprocess_ms";
+    for (const auto& pair : stereo_pairs_) {
+      timing_file_ << "," << pair << "_rect_ms,"
+                   << pair << "_infer_ms,"
+                   << pair << "_cloud_ms";
+    }
+    timing_file_ << ",combined_publish_ms,total_wall_ms\n";
+
+    RCLCPP_INFO(this->get_logger(), "Logging timing data to: %s", filename.c_str());
+
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR(this->get_logger(), "Error initializing logger: %s", e.what());
+  }
+}
+
+void DepthEstimation::LogTiming(double timestamp, double preprocess_ms,
+                                const std::vector<ProcessingResult>& results,
+                                double combined_publish_ms, double total_ms) {
+  if (!timing_file_.is_open()) return;
+
+  timing_file_ << std::fixed << std::setprecision(6) << timestamp << ","
+               << std::setprecision(3) << preprocess_ms;
+
+  // results vector corresponds to stereo_pairs_ order
+  for (const auto& res : results) {
+    timing_file_ << "," << res.rect_time_ms
+                 << "," << res.infer_time_ms
+                 << "," << res.cloud_time_ms;
+  }
+
+  timing_file_ << "," << combined_publish_ms << "," << total_ms << "\n";
+  timing_file_.flush();
 }
 
 void DepthEstimation::InitializeTransform() {
@@ -627,6 +688,11 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
 
   auto t_end_total = std::chrono::high_resolution_clock::now();
   double ms_total = std::chrono::duration<double, std::milli>(t_end_total - t_start_total).count();
+
+  if (enable_logging_) {
+    double timestamp = header.stamp.sec + header.stamp.nanosec * 1e-9;
+    LogTiming(timestamp, preprocessing_ms, results, ms_comb, ms_total);
+  }
 
   if (verbose_) {
       report << "--------------------------------\n";

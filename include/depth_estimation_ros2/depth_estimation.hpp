@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 #include <chrono>
+#include <fstream>
 
 namespace depth_estimation {
 
@@ -66,6 +67,7 @@ private:
   void InitializePublishers();
   void InitializeSubscribers();
   void InitializeServices();
+  void InitializeLogging();
 
   // --- Core Logic & Callbacks ---
   void CompressedImageCallback(const sensor_msgs::msg::CompressedImage::SharedPtr msg);
@@ -98,10 +100,13 @@ private:
   std::string GetSystemArchitecture();
   std::string GetGpuName();
   std::string SanitizeString(std::string str);
+  void LogTiming(double timestamp, double preprocess_ms,
+                 const std::vector<ProcessingResult>& results,
+                 double combined_publish_ms, double total_ms);
 
   // --- ROS Parameters ---
   bool verbose_ = false;
-  bool run_parallel_ = true; // NEW PARAMETER
+  bool run_parallel_ = true;
   bool use_compressed_image_ = true;
   std::string input_image_topic_;
   std::string transform_config_path_;
@@ -115,6 +120,11 @@ private:
   std::string combined_pointcloud_topic_;
   std::string pointcloud_frame_id_;
   bool filter_disparity_ = false;
+
+  // Logging parameters
+  bool enable_logging_ = false;
+  std::string logging_directory_;
+  std::ofstream timing_file_;
 
   // --- ONNX Runtime Members ---
   Ort::Env ort_env_;
