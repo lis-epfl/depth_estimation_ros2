@@ -42,7 +42,6 @@ struct StereoPairData {
   Eigen::Matrix4f transform_rect_left_to_cam0;
 };
 
-// Struct to hold results from a worker thread
 struct ProcessingResult {
     std::string pair_name;
     cv::Mat display_image;
@@ -50,6 +49,22 @@ struct ProcessingResult {
     double infer_time_ms;
     double cloud_time_ms;
     bool success;
+};
+
+// Pre-allocated workspace to prevent memory thrashing
+struct StereoWorkspace {
+    cv::Mat rect_left;
+    cv::Mat rect_right;
+    cv::Mat gray_left;
+    cv::Mat gray_right;
+    cv::Mat blob_left;
+    cv::Mat blob_right;
+    cv::Mat disparity;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_msg;
+
+    StereoWorkspace() {
+        cloud_msg = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    }
 };
 
 class DepthEstimation : public rclcpp::Node {
@@ -69,25 +84,22 @@ private:
   void InitializeServices();
   void InitializeLogging();
 
+  void AllocateWorkspaces();
+
   // --- Core Logic & Callbacks ---
   void CompressedImageCallback(const sensor_msgs::msg::CompressedImage::SharedPtr msg);
   void RawImageCallback(const sensor_msgs::msg::Image::SharedPtr msg);
 
-  // Core Processing Function
   void ProcessImage(const cv::Mat &concatenated_image,
                     const std_msgs::msg::Header &header,
                     const std::chrono::high_resolution_clock::time_point &t_start_total,
                     double preprocessing_ms);
 
-  // Inference Helper
-  cv::Mat RunInference(const cv::Mat &rectified_left,
-                       const cv::Mat &rectified_right,
-                       int session_idx);
+  void RunInference(StereoWorkspace& ws, int session_idx);
 
-  // Point Cloud Helper
-  pcl::PointCloud<pcl::PointXYZ>::Ptr
-  DisparityToPointCloud(const cv::Mat &disparity_map,
-                        const StereoPairData &pair_data);
+  void DisparityToPointCloud(const cv::Mat &disparity_map,
+                             const StereoPairData &pair_data,
+                             pcl::PointCloud<pcl::PointXYZ>::Ptr &out_cloud);
 
   // --- Service Callback ---
   void GetCameraInfoCallback(
@@ -121,16 +133,12 @@ private:
   std::string pointcloud_frame_id_;
   bool filter_disparity_ = false;
 
-  // Logging parameters
   bool enable_logging_ = false;
   std::string logging_directory_;
   std::ofstream timing_file_;
 
-  // --- ONNX Runtime Members ---
   Ort::Env ort_env_;
   Ort::SessionOptions session_options_;
-
-  // Vector of sessions
   std::vector<std::shared_ptr<Ort::Session>> ort_sessions_;
 
   std::vector<std::string> input_node_names_;
@@ -141,30 +149,21 @@ private:
   int model_half_height_ = 0;
   int model_half_width_ = 0;
 
-  // --- Data and State ---
   bool is_initialized_ = false;
   int fisheye_image_width_ = 0;
+
   std::map<std::string, StereoPairData> calibration_data_;
   Eigen::Matrix4f transform_cam0_to_centroid_;
 
-  // --- Threading Resources ---
-  std::mutex combined_cloud_mutex_; // Protects writes to the shared pointcloud
+  std::vector<StereoWorkspace> workspaces_;
+  std::mutex combined_cloud_mutex_;
 
-  // --- ROS Communication ---
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_image_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr raw_image_sub_;
-
-  std::map<std::string,
-           rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr>
-      pointcloud_pubs_;
-
-  // Single publisher for the stitched 2x2 grid
+  std::map<std::string, rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr> pointcloud_pubs_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr debug_grid_pub_;
-
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr
-      combined_pointcloud_pub_;
-  rclcpp::Service<depth_estimation_ros2::srv::GetCameraInfo>::SharedPtr
-      camera_info_service_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr combined_pointcloud_pub_;
+  rclcpp::Service<depth_estimation_ros2::srv::GetCameraInfo>::SharedPtr camera_info_service_;
 };
 
 } // namespace depth_estimation
