@@ -35,16 +35,394 @@ DepthEstimation::DepthEstimation(const rclcpp::NodeOptions &options)
   InitializePublishers();
   InitializeSubscribers();
   InitializeServices();
+  InitializePointcloudWorkers();
+
   is_initialized_ = true;
   RCLCPP_INFO(this->get_logger(),
               "Node initialization complete. Waiting for images...");
 }
 
 DepthEstimation::~DepthEstimation() {
+  ShutdownPointcloudWorkers();
+
   if (timing_file_.is_open()) {
     timing_file_.close();
   }
   RCLCPP_INFO(this->get_logger(), "Shutting down Depth Estimation Node.");
+}
+
+// ---------------------------------------------------------
+// ASYNC POINTCLOUD WORKERS
+// ---------------------------------------------------------
+
+void DepthEstimation::InitializePointcloudWorkers() {
+  RCLCPP_INFO(this->get_logger(), "Starting %d pointcloud worker threads...",
+              num_pointcloud_workers_);
+
+  shutdown_requested_ = false;
+
+  for (int i = 0; i < num_pointcloud_workers_; ++i) {
+    pointcloud_workers_.emplace_back([this]() {
+      PointcloudWorkerLoop();
+    });
+  }
+
+  RCLCPP_INFO(this->get_logger(), "Pointcloud workers started successfully.");
+}
+
+void DepthEstimation::ShutdownPointcloudWorkers() {
+  RCLCPP_INFO(this->get_logger(), "Shutting down pointcloud workers...");
+
+  shutdown_requested_ = true;
+  queue_cv_.notify_all();
+
+  for (auto& worker : pointcloud_workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+
+  pointcloud_workers_.clear();
+  RCLCPP_INFO(this->get_logger(), "Pointcloud workers shut down.");
+}
+
+void DepthEstimation::PointcloudWorkerLoop() {
+  while (!shutdown_requested_) {
+    DisparityPayload payload;
+
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex_);
+      queue_cv_.wait(lock, [this]() {
+        return !pointcloud_queue_.empty() || shutdown_requested_;
+      });
+
+      if (shutdown_requested_ && pointcloud_queue_.empty()) {
+        return;
+      }
+
+      payload = std::move(pointcloud_queue_.front());
+      pointcloud_queue_.pop();
+    }
+
+    ProcessPointcloudAsync(payload);
+  }
+}
+
+void DepthEstimation::EnqueueDisparity(DisparityPayload&& payload) {
+  std::lock_guard<std::mutex> lock(queue_mutex_);
+
+  // Drop oldest frames if queue is backing up
+  while (pointcloud_queue_.size() >= MAX_QUEUE_SIZE) {
+    auto dropped = std::move(pointcloud_queue_.front());
+    pointcloud_queue_.pop();
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(),
+                         1000, "Dropping pointcloud frame %lu - queue full",
+                         dropped.frame_id);
+
+    // Clean up aggregator for dropped frame if in combined mode
+    if (publish_combined_pointcloud_) {
+      std::lock_guard<std::mutex> agg_lock(aggregator_mutex_);
+      frame_aggregators_.erase(dropped.frame_id);
+    }
+
+    // Clean up timing data for dropped frame
+    {
+      std::lock_guard<std::mutex> timing_lock(timing_data_mutex_);
+      frame_timing_data_.erase(dropped.frame_id);
+    }
+  }
+
+  pointcloud_queue_.push(std::move(payload));
+  queue_cv_.notify_one();
+}
+
+void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
+  double cloud_time_ms = 0.0;
+  double viz_time_ms = 0.0;
+
+  // --- POINTCLOUD GENERATION ---
+  auto t_start_cloud = std::chrono::high_resolution_clock::now();
+
+  auto cloud = DisparityToPointCloud(payload.disparity_map,
+                                      payload.K_rect_left,
+                                      payload.baseline_meters);
+
+  // Transform to cam0 frame, then to centroid frame
+  auto cloud_in_cam0 = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  pcl::transformPointCloud(*cloud, *cloud_in_cam0, payload.transform_rect_left_to_cam0);
+
+  auto transformed_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+  pcl::transformPointCloud(*cloud_in_cam0, *transformed_cloud, transform_cam0_to_centroid_);
+
+  cloud_time_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::high_resolution_clock::now() - t_start_cloud).count();
+
+  // --- VISUALIZATION (if verbose) ---
+  cv::Mat display_image;
+  if (payload.verbose) {
+    auto t_start_viz = std::chrono::high_resolution_clock::now();
+
+    cv::Mat disparity_vis;
+    cv::Mat valid_mask = (payload.disparity_map > 0.0f) & (payload.disparity_map <= 128.0f);
+    cv::Mat disparity_normalized;
+    cv::normalize(payload.disparity_map, disparity_normalized, 0, 255, cv::NORM_MINMAX, CV_8U, valid_mask);
+    cv::applyColorMap(disparity_normalized, disparity_vis, cv::COLORMAP_JET);
+
+    cv::Mat display_mask;
+    cv::bitwise_not(valid_mask, display_mask);
+    disparity_vis.setTo(cv::Scalar(0, 0, 0), display_mask);
+
+    cv::Mat left_vis;
+    if (payload.rectified_left.channels() == 1) {
+        cv::cvtColor(payload.rectified_left, left_vis, cv::COLOR_GRAY2BGR);
+    } else {
+        left_vis = payload.rectified_left.clone();
+    }
+
+    if (left_vis.depth() != CV_8U) {
+        left_vis.convertTo(left_vis, CV_8U);
+    }
+
+    cv::hconcat(left_vis, disparity_vis, display_image);
+
+    std::string label = "Pair " + payload.pair_name;
+    cv::putText(display_image, label + " (RGB)", cv::Point(10, 30),
+                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+    cv::putText(display_image, label + " (Disp)", cv::Point(left_vis.cols + 10, 30),
+                cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+
+    viz_time_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t_start_viz).count();
+  }
+
+  // --- RECORD TIMING ---
+  {
+    std::lock_guard<std::mutex> lock(timing_data_mutex_);
+    auto it = frame_timing_data_.find(payload.frame_id);
+    if (it != frame_timing_data_.end()) {
+      std::lock_guard<std::mutex> timing_lock(it->second->timing_mutex);
+      it->second->cloud_times[payload.pair_name] = cloud_time_ms;
+      it->second->viz_times[payload.pair_name] = viz_time_ms;
+    }
+  }
+
+  // --- PUBLISH POINTCLOUD ---
+  if (publish_combined_pointcloud_) {
+    std::shared_ptr<FrameCloudAggregator> aggregator;
+
+    {
+      std::lock_guard<std::mutex> lock(aggregator_mutex_);
+      auto it = frame_aggregators_.find(payload.frame_id);
+      if (it == frame_aggregators_.end()) {
+        RCLCPP_WARN(this->get_logger(), "Aggregator not found for frame %lu", payload.frame_id);
+        return;
+      }
+      aggregator = it->second;
+    }
+
+    {
+      std::lock_guard<std::mutex> cloud_lock(aggregator->cloud_mutex);
+      *aggregator->combined_cloud += *transformed_cloud;
+    }
+
+    int count = aggregator->pairs_received.fetch_add(1) + 1;
+
+    if (count == static_cast<int>(stereo_pairs_.size())) {
+      auto combined_pc_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+      pcl::toROSMsg(*aggregator->combined_cloud, *combined_pc_msg);
+      combined_pc_msg->header = aggregator->header;
+      combined_pc_msg->header.frame_id = pointcloud_frame_id_;
+      combined_pointcloud_pub_->publish(std::move(combined_pc_msg));
+
+      {
+        std::lock_guard<std::mutex> lock(aggregator_mutex_);
+        frame_aggregators_.erase(payload.frame_id);
+      }
+    }
+  } else {
+    auto pc_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*transformed_cloud, *pc_msg);
+    pc_msg->header = payload.header;
+    pc_msg->header.frame_id = pointcloud_frame_id_;
+    pointcloud_pubs_[payload.pair_name]->publish(std::move(pc_msg));
+  }
+
+  // --- HANDLE DEBUG GRID ---
+  bool should_publish_grid = false;
+  bool should_print_timing = false;
+  std::vector<std::pair<std::string, cv::Mat>> images_to_stitch;
+
+  if (payload.verbose && !display_image.empty()) {
+    std::lock_guard<std::mutex> lock(debug_grid_mutex_);
+    frame_debug_images_[payload.frame_id].push_back({payload.pair_name, display_image.clone()});
+
+    if (frame_debug_images_[payload.frame_id].size() == stereo_pairs_.size()) {
+      should_publish_grid = true;
+      should_print_timing = true;
+      images_to_stitch = std::move(frame_debug_images_[payload.frame_id]);
+      frame_debug_images_.erase(payload.frame_id);
+
+      // Clean up old frames
+      std::vector<uint64_t> old_frames;
+      for (const auto& pair : frame_debug_images_) {
+        if (pair.first < payload.frame_id - 5) {
+          old_frames.push_back(pair.first);
+        }
+      }
+      for (auto frame : old_frames) {
+        frame_debug_images_.erase(frame);
+      }
+    }
+  }
+
+  // Check if all pairs completed (for timing report when not verbose)
+  if (!payload.verbose) {
+    std::lock_guard<std::mutex> lock(timing_data_mutex_);
+    auto it = frame_timing_data_.find(payload.frame_id);
+    if (it != frame_timing_data_.end()) {
+      int completed = it->second->pairs_completed.fetch_add(1) + 1;
+      if (completed == static_cast<int>(stereo_pairs_.size())) {
+        should_print_timing = true;
+      }
+    }
+  }
+
+  // Publish debug grid
+  if (should_publish_grid) {
+    std::sort(images_to_stitch.begin(), images_to_stitch.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::vector<cv::Mat> grid_images;
+    for (const auto& pair : images_to_stitch) {
+      grid_images.push_back(pair.second);
+    }
+
+    if (grid_images.size() == 4) {
+      cv::Mat top_row, bottom_row, grid_view;
+      cv::hconcat(grid_images[0], grid_images[1], top_row);
+      cv::hconcat(grid_images[2], grid_images[3], bottom_row);
+      cv::vconcat(top_row, bottom_row, grid_view);
+
+      std::vector<uchar> buffer;
+      if (cv::imencode(".jpg", grid_view, buffer)) {
+        auto msg = std::make_unique<sensor_msgs::msg::CompressedImage>();
+        msg->header = payload.header;
+        msg->format = "jpeg";
+        msg->data = buffer;
+        debug_grid_pub_->publish(std::move(msg));
+      }
+    }
+
+    // Update pairs_completed for verbose mode
+    {
+      std::lock_guard<std::mutex> lock(timing_data_mutex_);
+      auto it = frame_timing_data_.find(payload.frame_id);
+      if (it != frame_timing_data_.end()) {
+        it->second->pairs_completed.fetch_add(1);
+      }
+    }
+  }
+
+  // Print timing report and log
+  if (should_print_timing) {
+    if (verbose_) {
+      PrintFrameTimingReport(payload.frame_id);
+    }
+    if (enable_logging_) {
+      LogFrameTiming(payload.frame_id);
+    }
+
+    // Clean up timing data
+    {
+      std::lock_guard<std::mutex> lock(timing_data_mutex_);
+      frame_timing_data_.erase(payload.frame_id);
+    }
+  }
+}
+
+void DepthEstimation::PrintFrameTimingReport(uint64_t frame_id) {
+  std::shared_ptr<FrameTimingData> timing_data;
+
+  {
+    std::lock_guard<std::mutex> lock(timing_data_mutex_);
+    auto it = frame_timing_data_.find(frame_id);
+    if (it == frame_timing_data_.end()) return;
+    timing_data = it->second;
+  }
+
+  std::lock_guard<std::mutex> timing_lock(timing_data->timing_mutex);
+
+  std::stringstream report;
+  report << "\n=== FRAME " << frame_id << " TIMING ("
+         << (run_parallel_ ? "PARALLEL" : "SEQUENTIAL") << ") ===\n";
+  report << std::fixed << std::setprecision(2);
+  report << "Pre-process: " << timing_data->preprocess_ms << " ms\n";
+  report << "Inference Wall: " << timing_data->inference_wall_ms << " ms\n";
+
+  double total_cloud_ms = 0.0;
+  double total_viz_ms = 0.0;
+
+  for (const auto& pair_name : stereo_pairs_) {
+    double rect_ms = timing_data->rect_times.count(pair_name) ? timing_data->rect_times[pair_name] : 0.0;
+    double infer_ms = timing_data->infer_times.count(pair_name) ? timing_data->infer_times[pair_name] : 0.0;
+    double cloud_ms = timing_data->cloud_times.count(pair_name) ? timing_data->cloud_times[pair_name] : 0.0;
+    double viz_ms = timing_data->viz_times.count(pair_name) ? timing_data->viz_times[pair_name] : 0.0;
+
+    report << "  [" << pair_name << "] Rect:" << rect_ms
+           << " | Infer:" << infer_ms
+           << " | Cloud:" << cloud_ms;
+    if (verbose_) {
+      report << " | Viz:" << viz_ms;
+    }
+    report << " ms\n";
+
+    total_cloud_ms += cloud_ms;
+    total_viz_ms += viz_ms;
+  }
+
+  report << "--------------------------------\n";
+  report << "Total Cloud: " << total_cloud_ms << " ms";
+  if (verbose_) {
+    report << " | Total Viz: " << total_viz_ms << " ms";
+  }
+  report << "\n";
+  report << "INFERENCE FPS: " << (1000.0 / timing_data->inference_wall_ms);
+
+  RCLCPP_INFO(this->get_logger(), "%s", report.str().c_str());
+}
+
+void DepthEstimation::LogFrameTiming(uint64_t frame_id) {
+  std::shared_ptr<FrameTimingData> timing_data;
+
+  {
+    std::lock_guard<std::mutex> lock(timing_data_mutex_);
+    auto it = frame_timing_data_.find(frame_id);
+    if (it == frame_timing_data_.end()) return;
+    timing_data = it->second;
+  }
+
+  std::lock_guard<std::mutex> file_lock(logging_mutex_);
+  if (!timing_file_.is_open()) return;
+
+  std::lock_guard<std::mutex> timing_lock(timing_data->timing_mutex);
+
+  double timestamp = timing_data->header.stamp.sec + timing_data->header.stamp.nanosec * 1e-9;
+
+  timing_file_ << std::fixed << std::setprecision(6) << timestamp << ","
+               << std::setprecision(3) << timing_data->preprocess_ms << ","
+               << timing_data->inference_wall_ms;
+
+  for (const auto& pair_name : stereo_pairs_) {
+    double rect_ms = timing_data->rect_times.count(pair_name) ? timing_data->rect_times[pair_name] : 0.0;
+    double infer_ms = timing_data->infer_times.count(pair_name) ? timing_data->infer_times[pair_name] : 0.0;
+    double cloud_ms = timing_data->cloud_times.count(pair_name) ? timing_data->cloud_times[pair_name] : 0.0;
+    double viz_ms = timing_data->viz_times.count(pair_name) ? timing_data->viz_times[pair_name] : 0.0;
+
+    timing_file_ << "," << rect_ms << "," << infer_ms << "," << cloud_ms << "," << viz_ms;
+  }
+
+  timing_file_ << "\n";
+  timing_file_.flush();
 }
 
 // ---------------------------------------------------------
@@ -83,7 +461,7 @@ std::string DepthEstimation::GetGpuName() {
 
 void DepthEstimation::DeclareRosParameters() {
   this->declare_parameter<bool>("verbose", false);
-  this->declare_parameter<bool>("run_parallel", true); // Default: True (Multi-stream)
+  this->declare_parameter<bool>("run_parallel", true);
   this->declare_parameter<bool>("use_compressed_image", true);
   this->declare_parameter<std::string>("input_image_topic",
                                        "/oak_ffc_4p_driver_node/compressed");
@@ -109,6 +487,8 @@ void DepthEstimation::DeclareRosParameters() {
 
   this->declare_parameter<bool>("logging.enabled", true);
   this->declare_parameter<std::string>("logging.directory", "/tmp/depth_logs");
+
+  this->declare_parameter<int>("num_pointcloud_workers", 2);
 }
 
 void DepthEstimation::InitializeRosParameters() {
@@ -136,11 +516,14 @@ void DepthEstimation::InitializeRosParameters() {
   this->get_parameter("logging.enabled", enable_logging_);
   this->get_parameter("logging.directory", logging_directory_);
 
+  this->get_parameter("num_pointcloud_workers", num_pointcloud_workers_);
+
   if (verbose_) {
       RCLCPP_INFO(this->get_logger(), "Verbose mode ENABLED: Publishing 2x4 Debug Grid (Left|Disparity).");
   }
 
   RCLCPP_INFO(this->get_logger(), "Execution Mode: %s", run_parallel_ ? "PARALLEL (Multi-stream)" : "SEQUENTIAL (Single-stream)");
+  RCLCPP_INFO(this->get_logger(), "Async Pointcloud Workers: %d", num_pointcloud_workers_);
 
   if (calibration_base_path_.empty()) {
     throw std::runtime_error(
@@ -174,38 +557,20 @@ void DepthEstimation::InitializeLogging() {
     }
 
     // Write Header
-    timing_file_ << "timestamp,preprocess_ms";
+    timing_file_ << "timestamp,preprocess_ms,inference_wall_ms";
     for (const auto& pair : stereo_pairs_) {
-      timing_file_ << "," << pair << "_rect_ms,"
-                   << pair << "_infer_ms,"
-                   << pair << "_cloud_ms";
+      timing_file_ << "," << pair << "_rect_ms"
+                   << "," << pair << "_infer_ms"
+                   << "," << pair << "_cloud_ms"
+                   << "," << pair << "_viz_ms";
     }
-    timing_file_ << ",combined_publish_ms,total_wall_ms\n";
+    timing_file_ << "\n";
 
     RCLCPP_INFO(this->get_logger(), "Logging timing data to: %s", filename.c_str());
 
   } catch (const std::exception& e) {
     RCLCPP_ERROR(this->get_logger(), "Error initializing logger: %s", e.what());
   }
-}
-
-void DepthEstimation::LogTiming(double timestamp, double preprocess_ms,
-                                const std::vector<ProcessingResult>& results,
-                                double combined_publish_ms, double total_ms) {
-  if (!timing_file_.is_open()) return;
-
-  timing_file_ << std::fixed << std::setprecision(6) << timestamp << ","
-               << std::setprecision(3) << preprocess_ms;
-
-  // results vector corresponds to stereo_pairs_ order
-  for (const auto& res : results) {
-    timing_file_ << "," << res.rect_time_ms
-                 << "," << res.infer_time_ms
-                 << "," << res.cloud_time_ms;
-  }
-
-  timing_file_ << "," << combined_publish_ms << "," << total_ms << "\n";
-  timing_file_.flush();
 }
 
 void DepthEstimation::InitializeTransform() {
@@ -300,7 +665,6 @@ void DepthEstimation::InitializeModel() {
     trt_options.trt_fp16_enable = 1;
     trt_options.trt_engine_cache_enable = 1;
 
-    // --- CACHE DIRECTORY LOGIC ---
     std::string arch = GetSystemArchitecture();
     std::string gpu_name = GetGpuName();
     std::filesystem::path onnx_path(onnx_model_path_);
@@ -345,7 +709,6 @@ void DepthEstimation::InitializeModel() {
 
   ort_sessions_.clear();
 
-  // LOGIC: If parallel, create 4 sessions. If sequential, create 1 session.
   int num_sessions_to_create = run_parallel_ ? 4 : 1;
   RCLCPP_INFO(this->get_logger(), "Creating %d Inference Session(s)...", num_sessions_to_create);
 
@@ -407,7 +770,6 @@ void DepthEstimation::InitializePublishers() {
     pointcloud_pubs_[pair_str] = this->create_publisher<sensor_msgs::msg::PointCloud2>(topic_name, 10);
   }
 
-  // Initialize Combined Grid Publisher if Verbose is ON
   if (verbose_) {
       debug_grid_pub_ = this->create_publisher<sensor_msgs::msg::CompressedImage>("/depth/debug_grid/compressed", 10);
   }
@@ -483,7 +845,7 @@ void DepthEstimation::RawImageCallback(
   ProcessImage(cv_ptr->image, msg->header, t_start_total, ms_convert);
 }
 
-// --- CORE FUNCTION ---
+// --- CORE FUNCTION (INFERENCE ONLY - NO BLOCKING) ---
 void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
                                    const std_msgs::msg::Header &header,
                                    const std::chrono::high_resolution_clock::time_point &t_start_total,
@@ -491,6 +853,49 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
 
   if (fisheye_image_width_ == 0) {
     fisheye_image_width_ = concatenated_image.cols / 4;
+  }
+
+  // Get frame ID for this image
+  uint64_t current_frame_id = frame_counter_.fetch_add(1);
+
+  // Create timing data for this frame
+  auto timing_data = std::make_shared<FrameTimingData>();
+  timing_data->header = header;
+  timing_data->preprocess_ms = preprocessing_ms;
+
+  {
+    std::lock_guard<std::mutex> lock(timing_data_mutex_);
+    frame_timing_data_[current_frame_id] = timing_data;
+
+    // Clean up old timing data
+    std::vector<uint64_t> old_frames;
+    for (const auto& pair : frame_timing_data_) {
+      if (pair.first < current_frame_id - 20) {
+        old_frames.push_back(pair.first);
+      }
+    }
+    for (auto frame : old_frames) {
+      frame_timing_data_.erase(frame);
+    }
+  }
+
+  // If combined pointcloud mode, create aggregator for this frame
+  if (publish_combined_pointcloud_) {
+    std::lock_guard<std::mutex> lock(aggregator_mutex_);
+    auto aggregator = std::make_shared<FrameCloudAggregator>();
+    aggregator->header = header;
+    frame_aggregators_[current_frame_id] = aggregator;
+
+    // Clean up old aggregators
+    std::vector<uint64_t> old_frames;
+    for (const auto& pair : frame_aggregators_) {
+      if (pair.first < current_frame_id - 10) {
+        old_frames.push_back(pair.first);
+      }
+    }
+    for (auto frame : old_frames) {
+      frame_aggregators_.erase(frame);
+    }
   }
 
   // 1. SPLIT
@@ -501,10 +906,8 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
                  concatenated_image.rows)));
   }
 
-  auto combined_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-
-  // Define the worker function locally to avoid duplication
-  auto process_pair_task = [&](std::string pair_str, int s_idx) -> ProcessingResult {
+  // Define the worker function - ONLY rectify + inference, then queue
+  auto process_pair_task = [&](const std::string& pair_str, int s_idx) -> ProcessingResult {
       ProcessingResult res;
       res.pair_name = pair_str;
       res.success = false;
@@ -520,78 +923,41 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
                 pair_data.map_ly, cv::INTER_LINEAR);
       cv::remap(fisheye_images[right_idx], rectified_right, pair_data.map_rx,
                 pair_data.map_ry, cv::INTER_LINEAR);
-      res.rect_time_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start_rect).count();
+      res.rect_time_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - t_start_rect).count();
 
       // B. INFERENCE
       auto t_start_infer = std::chrono::high_resolution_clock::now();
       cv::Mat disparity_map = RunInference(rectified_left, rectified_right, s_idx);
-      res.infer_time_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start_infer).count();
+      res.infer_time_ms = std::chrono::duration<double, std::milli>(
+          std::chrono::high_resolution_clock::now() - t_start_infer).count();
 
       if (disparity_map.empty()) return res;
 
-      // C. VIZ PREP (Only generated if verbose is active)
-      if (verbose_) {
-          // 1. Prepare Disparity Visualization
-          cv::Mat disparity_vis;
-          cv::Mat valid_mask = (disparity_map > 0.0f) & (disparity_map <= 128.0f);
-          cv::Mat disparity_normalized;
-          cv::normalize(disparity_map, disparity_normalized, 0, 255, cv::NORM_MINMAX, CV_8U, valid_mask);
-          cv::applyColorMap(disparity_normalized, disparity_vis, cv::COLORMAP_JET);
-
-          // Apply black background to invalid pixels
-          cv::Mat display_mask;
-          cv::bitwise_not(valid_mask, display_mask);
-          disparity_vis.setTo(cv::Scalar(0, 0, 0), display_mask);
-
-          // 2. Prepare Original Image Visualization
-          cv::Mat left_vis;
-          // Ensure it is 3-channel BGR for concatenation
-          if (rectified_left.channels() == 1) {
-              cv::cvtColor(rectified_left, left_vis, cv::COLOR_GRAY2BGR);
-          } else {
-              left_vis = rectified_left.clone();
-          }
-
-          // Ensure depth matches (convert to 8-bit if needed)
-          if (left_vis.depth() != CV_8U) {
-              left_vis.convertTo(left_vis, CV_8U);
-          }
-
-          // 3. Concatenate (Left Image | Disparity)
-          // This creates a wide image for this specific pair
-          cv::hconcat(left_vis, disparity_vis, res.display_image);
-
-          // 4. Overlay Text
-          std::string label = "Pair " + pair_str;
-          // Draw label on the top-left of the original image
-          cv::putText(res.display_image, label + " (RGB)", cv::Point(10, 30),
-                      cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
-          // Draw label on the top-left of the disparity image (offset by width of left image)
-          cv::putText(res.display_image, label + " (Disp)", cv::Point(left_vis.cols + 10, 30),
-                      cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(255, 255, 255), 2);
+      // Record inference timing
+      {
+        std::lock_guard<std::mutex> lock(timing_data->timing_mutex);
+        timing_data->rect_times[pair_str] = res.rect_time_ms;
+        timing_data->infer_times[pair_str] = res.infer_time_ms;
       }
 
-      // D. POINT CLOUD
-      auto t_start_cloud = std::chrono::high_resolution_clock::now();
-      pcl::PointCloud<pcl::PointXYZ>::Ptr cloud = DisparityToPointCloud(disparity_map, pair_data);
-      auto cloud_in_cam0 = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-      pcl::transformPointCloud(*cloud, *cloud_in_cam0, pair_data.transform_rect_left_to_cam0);
-      auto transformed_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-      pcl::transformPointCloud(*cloud_in_cam0, *transformed_cloud, transform_cam0_to_centroid_);
+      // C. QUEUE FOR ASYNC PROCESSING (pointcloud + visualization)
+      DisparityPayload payload;
+      payload.disparity_map = disparity_map.clone();
+      payload.rectified_left = rectified_left.clone();  // Needed for visualization
+      payload.pair_name = pair_str;
+      payload.header = header;
+      payload.frame_id = current_frame_id;
+      payload.verbose = verbose_;
 
-      // E. PUBLISH / AGGREGATE
-      if (publish_combined_pointcloud_) {
-          std::lock_guard<std::mutex> lock(combined_cloud_mutex_);
-          *combined_cloud += *transformed_cloud;
-      } else {
-          auto pc_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-          pcl::toROSMsg(*transformed_cloud, *pc_msg);
-          pc_msg->header.stamp = header.stamp;
-          pc_msg->header.frame_id = pointcloud_frame_id_;
-          pointcloud_pubs_[pair_str]->publish(std::move(pc_msg));
-      }
+      // Copy calibration data
+      payload.resolution = pair_data.resolution;
+      payload.baseline_meters = pair_data.baseline_meters;
+      payload.K_rect_left = pair_data.K_rect_left.clone();
+      payload.transform_rect_left_to_cam0 = pair_data.transform_rect_left_to_cam0;
 
-      res.cloud_time_ms = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start_cloud).count();
+      EnqueueDisparity(std::move(payload));
+
       res.success = true;
       return res;
   };
@@ -602,103 +968,33 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
 
   int pair_idx = 0;
   for (const auto &pair_str : stereo_pairs_) {
-      // If parallel, use distinct sessions (idx = 0,1,2,3).
-      // If sequential, reuse session 0 (idx = 0).
       int session_idx = run_parallel_ ? pair_idx : 0;
 
       if (run_parallel_) {
           futures.push_back(std::async(std::launch::async, process_pair_task, pair_str, session_idx));
       } else {
-          // Sequential: Run immediately on this thread
           results.push_back(process_pair_task(pair_str, session_idx));
       }
       pair_idx++;
   }
 
-  // If parallel, wait for threads to finish and collect results
   if (run_parallel_) {
       for (auto &f : futures) {
           results.push_back(f.get());
       }
   }
 
-  // 3. REPORT & DEBUG VISUALIZATION
-  std::stringstream report;
-  std::vector<cv::Mat> grid_images;
+  // 3. RECORD INFERENCE WALL TIME
+  auto t_end_inference = std::chrono::high_resolution_clock::now();
+  double inference_wall_ms = std::chrono::duration<double, std::milli>(
+      t_end_inference - t_start_total).count();
 
-  if (verbose_) {
-    report << "\n=== PIPELINE REPORT (" << (run_parallel_ ? "PARALLEL" : "SEQUENTIAL") << ") ===\n";
-    report << "Pre-process: " << std::fixed << std::setprecision(2) << preprocessing_ms << " ms\n";
+  {
+    std::lock_guard<std::mutex> lock(timing_data->timing_mutex);
+    timing_data->inference_wall_ms = inference_wall_ms;
   }
 
-  for (const auto &res : results) {
-      if (res.success) {
-          if (verbose_) {
-              report << "  [" << res.pair_name << "] Rect:" << res.rect_time_ms
-                     << " | Infer:" << res.infer_time_ms
-                     << " | Cloud:" << res.cloud_time_ms << " ms\n";
-
-              if (!res.display_image.empty()) {
-                  grid_images.push_back(res.display_image);
-              } else {
-                  // Fallback black image (approximating 2x width)
-                  grid_images.push_back(cv::Mat::zeros(cv::Size(448, 224), CV_8UC3));
-              }
-          }
-      } else {
-           if (verbose_) {
-               report << "  [" << res.pair_name << "] FAILED\n";
-               grid_images.push_back(cv::Mat::zeros(cv::Size(448, 224), CV_8UC3));
-           }
-      }
-  }
-
-  // 4. COMBINED GRID PUBLISH (Only if Verbose)
-  if (verbose_ && grid_images.size() == 4) {
-      cv::Mat top_row, bottom_row, grid_view;
-      // Because grid_images[i] is now [Left | Disp], this concatenates them to [Left0 | Disp0 | Left1 | Disp1]
-      cv::hconcat(grid_images[0], grid_images[1], top_row);
-      cv::hconcat(grid_images[2], grid_images[3], bottom_row);
-      cv::vconcat(top_row, bottom_row, grid_view);
-
-      std::vector<uchar> buffer;
-      if (cv::imencode(".jpg", grid_view, buffer)) {
-          auto msg = std::make_unique<sensor_msgs::msg::CompressedImage>();
-          msg->header = header;
-          msg->format = "jpeg";
-          msg->data = buffer;
-          debug_grid_pub_->publish(std::move(msg));
-      }
-  }
-
-  // 5. COMBINED POINTCLOUD PUBLISH
-  auto t_start_comb = std::chrono::high_resolution_clock::now();
-  if (publish_combined_pointcloud_) {
-    auto combined_pc_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-    pcl::toROSMsg(*combined_cloud, *combined_pc_msg);
-    combined_pc_msg->header.stamp = header.stamp;
-    combined_pc_msg->header.frame_id = pointcloud_frame_id_;
-    combined_pointcloud_pub_->publish(std::move(combined_pc_msg));
-  }
-  double ms_comb = std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_start_comb).count();
-
-  if (verbose_ && publish_combined_pointcloud_) {
-      report << "Combined Publish: " << ms_comb << " ms\n";
-  }
-
-  auto t_end_total = std::chrono::high_resolution_clock::now();
-  double ms_total = std::chrono::duration<double, std::milli>(t_end_total - t_start_total).count();
-
-  if (enable_logging_) {
-    double timestamp = header.stamp.sec + header.stamp.nanosec * 1e-9;
-    LogTiming(timestamp, preprocessing_ms, results, ms_comb, ms_total);
-  }
-
-  if (verbose_) {
-      report << "--------------------------------\n";
-      report << "TOTAL WALL TIME: " << ms_total << " ms (" << (1000.0/ms_total) << " FPS)";
-      RCLCPP_INFO(this->get_logger(), "%s", report.str().c_str());
-  }
+  // Note: Full timing report will be printed by async workers when all pairs complete
 }
 
 cv::Mat DepthEstimation::RunInference(const cv::Mat &rectified_left,
@@ -753,7 +1049,7 @@ cv::Mat DepthEstimation::RunInference(const cv::Mat &rectified_left,
     left_bgr.convertTo(left_bgr, CV_32F);
     right_bgr.convertTo(right_bgr, CV_32F);
 
-    if (input_node_names_.size() == 4) { // 4-Input
+    if (input_node_names_.size() == 4) {
       cv::Mat left_full_resized, right_full_resized, left_half_resized, right_half_resized;
       cv::resize(left_bgr, left_full_resized, cv::Size(model_full_width_, model_full_height_));
       cv::resize(right_bgr, right_full_resized, cv::Size(model_full_width_, model_full_height_));
@@ -770,7 +1066,7 @@ cv::Mat DepthEstimation::RunInference(const cv::Mat &rectified_left,
       input_tensors.push_back(Ort::Value::CreateTensor<float>(allocator.GetInfo(), blob_left.ptr<float>(), blob_left.total(), input_node_dims_[2].data(), input_node_dims_[2].size()));
       input_tensors.push_back(Ort::Value::CreateTensor<float>(allocator.GetInfo(), blob_right.ptr<float>(), blob_right.total(), input_node_dims_[3].data(), input_node_dims_[3].size()));
 
-    } else if (input_node_names_.size() == 2) { // 2-Input
+    } else if (input_node_names_.size() == 2) {
       cv::Mat left_resized, right_resized;
       cv::resize(left_bgr, left_resized, cv::Size(model_full_width_, model_full_height_));
       cv::resize(right_bgr, right_resized, cv::Size(model_full_width_, model_full_height_));
@@ -833,18 +1129,20 @@ cv::Mat DepthEstimation::RunInference(const cv::Mat &rectified_left,
 }
 
 pcl::PointCloud<pcl::PointXYZ>::Ptr
-DepthEstimation::DisparityToPointCloud(const cv::Mat &disparity_map, const StereoPairData &pair_data) {
+DepthEstimation::DisparityToPointCloud(const cv::Mat &disparity_map,
+                                        const cv::Mat &K_rect_left,
+                                        double baseline_meters) {
   auto cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   cloud->width = disparity_map.cols;
   cloud->height = disparity_map.rows;
   cloud->is_dense = false;
   cloud->points.resize(cloud->width * cloud->height);
 
-  const double fx = pair_data.K_rect_left.at<double>(0, 0);
-  const double fy = pair_data.K_rect_left.at<double>(1, 1);
-  const double cx = pair_data.K_rect_left.at<double>(0, 2);
-  const double cy = pair_data.K_rect_left.at<double>(1, 2);
-  const double baseline = pair_data.baseline_meters;
+  const double fx = K_rect_left.at<double>(0, 0);
+  const double fy = K_rect_left.at<double>(1, 1);
+  const double cx = K_rect_left.at<double>(0, 2);
+  const double cy = K_rect_left.at<double>(1, 2);
+  const double baseline = baseline_meters;
 
   for (int v = 0; v < disparity_map.rows; ++v) {
     for (int u = 0; u < disparity_map.cols; ++u) {

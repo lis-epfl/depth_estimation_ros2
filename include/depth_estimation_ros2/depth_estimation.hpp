@@ -31,6 +31,10 @@
 #include <vector>
 #include <chrono>
 #include <fstream>
+#include <queue>
+#include <condition_variable>
+#include <atomic>
+#include <thread>
 
 namespace depth_estimation {
 
@@ -42,14 +46,53 @@ struct StereoPairData {
   Eigen::Matrix4f transform_rect_left_to_cam0;
 };
 
-// Struct to hold results from a worker thread
+// Struct to hold results from inference (main thread)
 struct ProcessingResult {
     std::string pair_name;
-    cv::Mat display_image;
     double rect_time_ms;
     double infer_time_ms;
-    double cloud_time_ms;
     bool success;
+};
+
+// Struct to hold data for async pointcloud processing
+struct DisparityPayload {
+    cv::Mat disparity_map;
+    cv::Mat rectified_left;  // For visualization
+    std::string pair_name;
+    std_msgs::msg::Header header;
+    uint64_t frame_id;
+    bool verbose;  // Whether to generate debug visualization
+
+    // Calibration data (copied for thread safety)
+    cv::Size resolution;
+    double baseline_meters;
+    cv::Mat K_rect_left;
+    Eigen::Matrix4f transform_rect_left_to_cam0;
+};
+
+// Struct for aggregating combined pointcloud per frame
+struct FrameCloudAggregator {
+    pcl::PointCloud<pcl::PointXYZ>::Ptr combined_cloud;
+    std_msgs::msg::Header header;
+    std::atomic<int> pairs_received{0};
+    std::mutex cloud_mutex;
+
+    FrameCloudAggregator() : combined_cloud(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>()) {}
+};
+
+// Struct for tracking async timing per frame
+struct FrameTimingData {
+    std_msgs::msg::Header header;
+    double preprocess_ms;
+    double inference_wall_ms;  // Total wall time for inference phase
+    std::map<std::string, double> rect_times;
+    std::map<std::string, double> infer_times;
+    std::map<std::string, double> cloud_times;
+    std::map<std::string, double> viz_times;
+    std::atomic<int> pairs_completed{0};
+    std::mutex timing_mutex;
+
+    FrameTimingData() = default;
 };
 
 class DepthEstimation : public rclcpp::Node {
@@ -68,6 +111,8 @@ private:
   void InitializeSubscribers();
   void InitializeServices();
   void InitializeLogging();
+  void InitializePointcloudWorkers();
+  void ShutdownPointcloudWorkers();
 
   // --- Core Logic & Callbacks ---
   void CompressedImageCallback(const sensor_msgs::msg::CompressedImage::SharedPtr msg);
@@ -87,7 +132,17 @@ private:
   // Point Cloud Helper
   pcl::PointCloud<pcl::PointXYZ>::Ptr
   DisparityToPointCloud(const cv::Mat &disparity_map,
-                        const StereoPairData &pair_data);
+                        const cv::Mat &K_rect_left,
+                        double baseline_meters);
+
+  // Async pointcloud processing
+  void PointcloudWorkerLoop();
+  void EnqueueDisparity(DisparityPayload&& payload);
+  void ProcessPointcloudAsync(DisparityPayload& payload);
+
+  // Timing report helper
+  void PrintFrameTimingReport(uint64_t frame_id);
+  void LogFrameTiming(uint64_t frame_id);
 
   // --- Service Callback ---
   void GetCameraInfoCallback(
@@ -100,9 +155,6 @@ private:
   std::string GetSystemArchitecture();
   std::string GetGpuName();
   std::string SanitizeString(std::string str);
-  void LogTiming(double timestamp, double preprocess_ms,
-                 const std::vector<ProcessingResult>& results,
-                 double combined_publish_ms, double total_ms);
 
   // --- ROS Parameters ---
   bool verbose_ = false;
@@ -125,6 +177,7 @@ private:
   bool enable_logging_ = false;
   std::string logging_directory_;
   std::ofstream timing_file_;
+  std::mutex logging_mutex_;
 
   // --- ONNX Runtime Members ---
   Ort::Env ort_env_;
@@ -147,8 +200,27 @@ private:
   std::map<std::string, StereoPairData> calibration_data_;
   Eigen::Matrix4f transform_cam0_to_centroid_;
 
-  // --- Threading Resources ---
-  std::mutex combined_cloud_mutex_; // Protects writes to the shared pointcloud
+  // --- Async Pointcloud Processing ---
+  std::queue<DisparityPayload> pointcloud_queue_;
+  std::mutex queue_mutex_;
+  std::condition_variable queue_cv_;
+  std::atomic<bool> shutdown_requested_{false};
+  std::vector<std::thread> pointcloud_workers_;
+  int num_pointcloud_workers_ = 2;
+  static constexpr size_t MAX_QUEUE_SIZE = 16;
+
+  // Frame-based aggregation for combined pointcloud
+  std::atomic<uint64_t> frame_counter_{0};
+  std::map<uint64_t, std::shared_ptr<FrameCloudAggregator>> frame_aggregators_;
+  std::mutex aggregator_mutex_;
+
+  // --- Debug Grid (for verbose mode) ---
+  std::mutex debug_grid_mutex_;
+  std::map<uint64_t, std::vector<std::pair<std::string, cv::Mat>>> frame_debug_images_;
+
+  // --- Frame Timing Tracking ---
+  std::map<uint64_t, std::shared_ptr<FrameTimingData>> frame_timing_data_;
+  std::mutex timing_data_mutex_;
 
   // --- ROS Communication ---
   rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_image_sub_;

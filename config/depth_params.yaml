@@ -10,7 +10,7 @@ depth_estimation_node:
     transform_config_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/config/cam0_to_centroid.yaml"
 
     # Path to the ONNX model. Use an absolute path.
-    onnx_model_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/models/S2M2_S_192_192_v2_torch29.onnx"
+    onnx_model_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/models/S2M2_S_256_160_v2_torch29.onnx"
 
     # ONNX Runtime execution provider: "tensorrt", "cuda", or "cpu"
     execution_provider: "tensorrt"
@@ -21,15 +21,15 @@ depth_estimation_node:
     # List of stereo pairs to process
     stereo_pairs: ["0_1", "1_2", "2_3", "3_0"]
 
-    # --- NEW: Dynamic Calibration Path Parameters ---
+    # --- Dynamic Calibration Path Parameters ---
     # Base path where all calibration folders (e.g., 'final_maps_120_160') are stored.
     calibration_base_path: "/home/toumieh/ros2_ws/src/depth_estimation_ros2/config"
 
     # The resolution folder to use. This should match the folder name suffix.
-    calibration_resolution: "192_192"
+    calibration_resolution: "256_160"
 
     # Whether to publish a single, combined point cloud.
-    publish_combined_pointcloud: false
+    publish_combined_pointcloud: true
 
     # Topic for the combined point cloud.
     combined_pointcloud_topic: "/depth/pointcloud/combined"
@@ -45,3 +45,15 @@ depth_estimation_node:
 
     # if true send depth images on ros2 topic and compute time in the terminal
     verbose: true
+
+    # --- NEW: Async Pointcloud Parameters ---
+    # Number of worker threads for async pointcloud generation
+    # Recommended: 2-4 depending on CPU cores available
+    num_pointcloud_workers: 2
+
+    # --- Logging Parameters ---
+    # CSV columns: timestamp, preprocess_ms, inference_wall_ms,
+    #              then for each pair: rect_ms, infer_ms, cloud_ms, viz_ms
+    logging:
+      enabled: true
+      directory: "/tmp/depth_logs"

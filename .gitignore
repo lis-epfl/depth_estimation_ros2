@@ -1,9 +1,6 @@
 # ignore the calibration mappings
 config/final_maps_*
 
-# ignore the tensorrt engines of my own pc
-models/*A2000*
-
 # ignore all the models because they are too big for github and will be downloaded form somewhere else
 models
 
