@@ -44,6 +44,10 @@ struct StereoPairData {
   cv::Mat K_rect_left;
   cv::Mat map_lx, map_ly, map_rx, map_ry;
   Eigen::Matrix4f transform_rect_left_to_cam0;
+
+  // --- DEPTH CORRECTION PARAMETERS ---
+  double baseline_scale;      // Multiplier for baseline (default: 1.0)
+  double disparity_offset;    // Pixels to subtract from disparity (default: 0.0)
 };
 
 // Struct to hold results from inference (main thread)
@@ -62,12 +66,17 @@ struct DisparityPayload {
     std_msgs::msg::Header header;
     uint64_t frame_id;
     bool verbose;  // Whether to generate debug visualization
+    size_t pair_index;  // Index of this pair (0-3) for combined cloud offset
 
     // Calibration data (copied for thread safety)
     cv::Size resolution;
     double baseline_meters;
     cv::Mat K_rect_left;
     Eigen::Matrix4f transform_rect_left_to_cam0;
+
+    // --- DEPTH CORRECTION PARAMETERS ---
+    double baseline_scale;      // Multiplier for baseline
+    double disparity_offset;    // Pixels to subtract from disparity
 };
 
 // Struct for aggregating combined pointcloud per frame
@@ -76,8 +85,23 @@ struct FrameCloudAggregator {
     std_msgs::msg::Header header;
     std::atomic<int> pairs_received{0};
     std::mutex cloud_mutex;
+    size_t points_per_pair;  // Pre-computed: width * height
+    size_t num_pairs;
 
-    FrameCloudAggregator() : combined_cloud(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>()) {}
+    // Constructor with pre-allocation
+    FrameCloudAggregator(size_t num_pairs_, size_t points_per_pair_)
+        : combined_cloud(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>()),
+          points_per_pair(points_per_pair_),
+          num_pairs(num_pairs_) {
+        // Pre-allocate full size to avoid reallocations
+        combined_cloud->points.resize(num_pairs * points_per_pair);
+        combined_cloud->width = num_pairs * points_per_pair;
+        combined_cloud->height = 1;
+        combined_cloud->is_dense = false;
+    }
+
+    FrameCloudAggregator() : combined_cloud(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>()),
+                             points_per_pair(0), num_pairs(0) {}
 };
 
 // Struct for tracking async timing per frame
@@ -129,11 +153,14 @@ private:
                        const cv::Mat &rectified_right,
                        int session_idx);
 
-  // Point Cloud Helper
+  // Point Cloud Helper (optimized: single loop with combined transform)
   pcl::PointCloud<pcl::PointXYZ>::Ptr
   DisparityToPointCloud(const cv::Mat &disparity_map,
                         const cv::Mat &K_rect_left,
-                        double baseline_meters);
+                        double baseline_meters,
+                        double baseline_scale,
+                        double disparity_offset,
+                        const Eigen::Matrix4f &combined_transform);
 
   // Async pointcloud processing
   void PointcloudWorkerLoop();
@@ -172,6 +199,9 @@ private:
   std::string combined_pointcloud_topic_;
   std::string pointcloud_frame_id_;
   bool filter_disparity_ = false;
+
+  // NOTE: depth_correction parameters are loaded from calibration folder
+  // and stored directly in StereoPairData, not as class members
 
   // Logging parameters
   bool enable_logging_ = false;

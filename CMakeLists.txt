@@ -20,6 +20,14 @@ find_package(OpenCV REQUIRED)
 find_package(PCL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
+# OpenMP for parallel pointcloud computation
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+  message(STATUS "OpenMP found - enabling parallel pointcloud computation")
+else()
+  message(WARNING "OpenMP not found - pointcloud computation will be single-threaded")
+endif()
+
 # Need CUDA only for getting GPU Name (driver API), not OpenCV-CUDA modules
 find_package(CUDA REQUIRED)
 
@@ -71,6 +79,11 @@ target_link_libraries(depth_estimation_node
   ${CUDA_LIBRARIES}
   ${cpp_typesupport_target}
 )
+
+# Link OpenMP if available
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(depth_estimation_node OpenMP::OpenMP_CXX)
+endif()
 
 add_dependencies(depth_estimation_node ${PROJECT_NAME})
 

@@ -6,10 +6,15 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <iomanip>
 #include <sstream>
 #include <string>
 #include <algorithm>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace depth_estimation {
 
@@ -58,6 +63,13 @@ DepthEstimation::~DepthEstimation() {
 void DepthEstimation::InitializePointcloudWorkers() {
   RCLCPP_INFO(this->get_logger(), "Starting %d pointcloud worker threads...",
               num_pointcloud_workers_);
+
+#ifdef _OPENMP
+  RCLCPP_INFO(this->get_logger(), "OpenMP enabled with %d threads available.",
+              omp_get_max_threads());
+#else
+  RCLCPP_WARN(this->get_logger(), "OpenMP not available. Pointcloud computation will be single-threaded.");
+#endif
 
   shutdown_requested_ = false;
 
@@ -140,19 +152,20 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
   double cloud_time_ms = 0.0;
   double viz_time_ms = 0.0;
 
-  // --- POINTCLOUD GENERATION ---
+  // --- POINTCLOUD GENERATION (OPTIMIZED: single loop with combined transform) ---
   auto t_start_cloud = std::chrono::high_resolution_clock::now();
 
-  auto cloud = DisparityToPointCloud(payload.disparity_map,
-                                      payload.K_rect_left,
-                                      payload.baseline_meters);
+  // Pre-compute combined transform: centroid <- cam0 <- rect_left
+  Eigen::Matrix4f combined_transform = transform_cam0_to_centroid_ * payload.transform_rect_left_to_cam0;
 
-  // Transform to cam0 frame, then to centroid frame
-  auto cloud_in_cam0 = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-  pcl::transformPointCloud(*cloud, *cloud_in_cam0, payload.transform_rect_left_to_cam0);
-
-  auto transformed_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-  pcl::transformPointCloud(*cloud_in_cam0, *transformed_cloud, transform_cam0_to_centroid_);
+  // Single function call with combined transform - no separate transformPointCloud calls
+  auto transformed_cloud = DisparityToPointCloud(
+      payload.disparity_map,
+      payload.K_rect_left,
+      payload.baseline_meters,
+      payload.baseline_scale,
+      payload.disparity_offset,
+      combined_transform);
 
   cloud_time_ms = std::chrono::duration<double, std::milli>(
       std::chrono::high_resolution_clock::now() - t_start_cloud).count();
@@ -214,15 +227,26 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
       std::lock_guard<std::mutex> lock(aggregator_mutex_);
       auto it = frame_aggregators_.find(payload.frame_id);
       if (it == frame_aggregators_.end()) {
-        RCLCPP_WARN(this->get_logger(), "Aggregator not found for frame %lu", payload.frame_id);
-        return;
+        // Aggregator not yet created - create it now (handles race condition at startup)
+        size_t points_per_pair = payload.resolution.width * payload.resolution.height;
+        auto new_aggregator = std::make_shared<FrameCloudAggregator>(stereo_pairs_.size(), points_per_pair);
+        new_aggregator->header = payload.header;
+        frame_aggregators_[payload.frame_id] = new_aggregator;
+        aggregator = new_aggregator;
+      } else {
+        aggregator = it->second;
       }
-      aggregator = it->second;
     }
 
+    // Direct memory copy to pre-allocated offset (no reallocation!)
     {
-      std::lock_guard<std::mutex> cloud_lock(aggregator->cloud_mutex);
-      *aggregator->combined_cloud += *transformed_cloud;
+      const size_t offset = payload.pair_index * aggregator->points_per_pair;
+      const size_t num_points = transformed_cloud->points.size();
+
+      // Copy points directly to the pre-allocated region
+      std::memcpy(&aggregator->combined_cloud->points[offset],
+                  transformed_cloud->points.data(),
+                  num_points * sizeof(pcl::PointXYZ));
     }
 
     int count = aggregator->pairs_received.fetch_add(1) + 1;
@@ -489,6 +513,9 @@ void DepthEstimation::DeclareRosParameters() {
   this->declare_parameter<std::string>("logging.directory", "/tmp/depth_logs");
 
   this->declare_parameter<int>("num_pointcloud_workers", 2);
+
+  // NOTE: depth_correction parameters are loaded from calibration folder
+  // (final_maps_*/depth_corrections.yaml), not from ROS parameters
 }
 
 void DepthEstimation::InitializeRosParameters() {
@@ -517,6 +544,8 @@ void DepthEstimation::InitializeRosParameters() {
   this->get_parameter("logging.directory", logging_directory_);
 
   this->get_parameter("num_pointcloud_workers", num_pointcloud_workers_);
+
+  // NOTE: depth_correction parameters are loaded from calibration folder in InitializeCalibrationData()
 
   if (verbose_) {
       RCLCPP_INFO(this->get_logger(), "Verbose mode ENABLED: Publishing 2x4 Debug Grid (Left|Disparity).");
@@ -730,7 +759,61 @@ void DepthEstimation::InitializeCalibrationData() {
   RCLCPP_INFO(this->get_logger(), "Loading calibration data...");
   const std::string calibration_dir = calibration_base_path_ + "/final_maps_" + calibration_resolution_;
 
-  for (const auto &pair_str : stereo_pairs_) {
+  // --- LOAD DEPTH CORRECTIONS FROM FILE ---
+  std::string depth_corrections_path = calibration_dir + "/depth_corrections.yaml";
+  std::vector<double> baseline_scales;
+  std::vector<double> disparity_offsets;
+
+  if (std::filesystem::exists(depth_corrections_path)) {
+    RCLCPP_INFO(this->get_logger(), "Loading depth corrections from: %s", depth_corrections_path.c_str());
+    try {
+      YAML::Node corrections = YAML::LoadFile(depth_corrections_path);
+
+      if (corrections["depth_correction"]) {
+        if (corrections["depth_correction"]["baseline_scales"]) {
+          baseline_scales = corrections["depth_correction"]["baseline_scales"].as<std::vector<double>>();
+        }
+        if (corrections["depth_correction"]["disparity_offsets"]) {
+          disparity_offsets = corrections["depth_correction"]["disparity_offsets"].as<std::vector<double>>();
+        }
+      }
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(this->get_logger(), "Failed to parse depth_corrections.yaml: %s. Using defaults.", e.what());
+    }
+  } else {
+    RCLCPP_WARN(this->get_logger(), "depth_corrections.yaml not found at %s. Using default values (no correction).",
+                depth_corrections_path.c_str());
+  }
+
+  // Validate and fill with defaults if needed
+  if (baseline_scales.size() != stereo_pairs_.size()) {
+    if (!baseline_scales.empty()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "baseline_scales size (%zu) doesn't match stereo_pairs size (%zu). Using default 1.0.",
+                  baseline_scales.size(), stereo_pairs_.size());
+    }
+    baseline_scales.assign(stereo_pairs_.size(), 1.0);
+  }
+
+  if (disparity_offsets.size() != stereo_pairs_.size()) {
+    if (!disparity_offsets.empty()) {
+      RCLCPP_WARN(this->get_logger(),
+                  "disparity_offsets size (%zu) doesn't match stereo_pairs size (%zu). Using default 0.0.",
+                  disparity_offsets.size(), stereo_pairs_.size());
+    }
+    disparity_offsets.assign(stereo_pairs_.size(), 0.0);
+  }
+
+  // Log depth correction parameters
+  RCLCPP_INFO(this->get_logger(), "=== DEPTH CORRECTION PARAMETERS ===");
+  for (size_t i = 0; i < stereo_pairs_.size(); ++i) {
+    RCLCPP_INFO(this->get_logger(), "  Pair %s: baseline_scale=%.4f, disparity_offset=%.4f",
+                stereo_pairs_[i].c_str(), baseline_scales[i], disparity_offsets[i]);
+  }
+
+  // --- LOAD PER-PAIR CALIBRATION DATA ---
+  for (size_t pair_idx = 0; pair_idx < stereo_pairs_.size(); ++pair_idx) {
+    const auto &pair_str = stereo_pairs_[pair_idx];
     std::string map_path = calibration_dir + "/final_rectified_to_fisheye_map_" + pair_str + ".yml";
     std::string config_path = calibration_dir + "/final_map_config_" + pair_str + ".yaml";
 
@@ -757,6 +840,13 @@ void DepthEstimation::InitializeCalibrationData() {
     fs["map_right_x"] >> data.map_rx;
     fs["map_right_y"] >> data.map_ry;
     fs.release();
+
+    // --- ASSIGN DEPTH CORRECTION PARAMETERS FOR THIS PAIR ---
+    data.baseline_scale = baseline_scales[pair_idx];
+    data.disparity_offset = disparity_offsets[pair_idx];
+
+    RCLCPP_INFO(this->get_logger(), "Loaded pair %s: baseline=%.6f m, scale=%.4f, offset=%.4f px",
+                pair_str.c_str(), data.baseline_meters, data.baseline_scale, data.disparity_offset);
 
     calibration_data_[pair_str] = data;
   }
@@ -882,7 +972,13 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
   // If combined pointcloud mode, create aggregator for this frame
   if (publish_combined_pointcloud_) {
     std::lock_guard<std::mutex> lock(aggregator_mutex_);
-    auto aggregator = std::make_shared<FrameCloudAggregator>();
+
+    // Get resolution from first pair to calculate points_per_pair
+    const auto &first_pair_data = calibration_data_.at(stereo_pairs_[0]);
+    size_t points_per_pair = first_pair_data.resolution.width * first_pair_data.resolution.height;
+
+    // Create aggregator with pre-allocated cloud
+    auto aggregator = std::make_shared<FrameCloudAggregator>(stereo_pairs_.size(), points_per_pair);
     aggregator->header = header;
     frame_aggregators_[current_frame_id] = aggregator;
 
@@ -907,7 +1003,7 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
   }
 
   // Define the worker function - ONLY rectify + inference, then queue
-  auto process_pair_task = [&](const std::string& pair_str, int s_idx) -> ProcessingResult {
+  auto process_pair_task = [&](const std::string& pair_str, int s_idx, size_t p_idx) -> ProcessingResult {
       ProcessingResult res;
       res.pair_name = pair_str;
       res.success = false;
@@ -949,12 +1045,17 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
       payload.header = header;
       payload.frame_id = current_frame_id;
       payload.verbose = verbose_;
+      payload.pair_index = p_idx;  // Index for combined cloud offset
 
       // Copy calibration data
       payload.resolution = pair_data.resolution;
       payload.baseline_meters = pair_data.baseline_meters;
       payload.K_rect_left = pair_data.K_rect_left.clone();
       payload.transform_rect_left_to_cam0 = pair_data.transform_rect_left_to_cam0;
+
+      // --- COPY DEPTH CORRECTION PARAMETERS ---
+      payload.baseline_scale = pair_data.baseline_scale;
+      payload.disparity_offset = pair_data.disparity_offset;
 
       EnqueueDisparity(std::move(payload));
 
@@ -966,14 +1067,14 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
   std::vector<ProcessingResult> results;
   std::vector<std::future<ProcessingResult>> futures;
 
-  int pair_idx = 0;
+  size_t pair_idx = 0;
   for (const auto &pair_str : stereo_pairs_) {
-      int session_idx = run_parallel_ ? pair_idx : 0;
+      int session_idx = run_parallel_ ? static_cast<int>(pair_idx) : 0;
 
       if (run_parallel_) {
-          futures.push_back(std::async(std::launch::async, process_pair_task, pair_str, session_idx));
+          futures.push_back(std::async(std::launch::async, process_pair_task, pair_str, session_idx, pair_idx));
       } else {
-          results.push_back(process_pair_task(pair_str, session_idx));
+          results.push_back(process_pair_task(pair_str, session_idx, pair_idx));
       }
       pair_idx++;
   }
@@ -1128,36 +1229,79 @@ cv::Mat DepthEstimation::RunInference(const cv::Mat &rectified_left,
   return disparity_map;
 }
 
+// =============================================================================
+// OPTIMIZED POINTCLOUD GENERATION
+// - Single loop (no separate transformPointCloud calls)
+// - Single memory allocation
+// - Combined transform applied inline
+// - OpenMP parallelization for multi-core speedup
+// =============================================================================
 pcl::PointCloud<pcl::PointXYZ>::Ptr
 DepthEstimation::DisparityToPointCloud(const cv::Mat &disparity_map,
                                         const cv::Mat &K_rect_left,
-                                        double baseline_meters) {
+                                        double baseline_meters,
+                                        double baseline_scale,
+                                        double disparity_offset,
+                                        const Eigen::Matrix4f &combined_transform) {
   auto cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   cloud->width = disparity_map.cols;
   cloud->height = disparity_map.rows;
   cloud->is_dense = false;
   cloud->points.resize(cloud->width * cloud->height);
 
+  // Camera intrinsics
   const double fx = K_rect_left.at<double>(0, 0);
   const double fy = K_rect_left.at<double>(1, 1);
   const double cx = K_rect_left.at<double>(0, 2);
   const double cy = K_rect_left.at<double>(1, 2);
-  const double baseline = baseline_meters;
 
-  for (int v = 0; v < disparity_map.rows; ++v) {
-    for (int u = 0; u < disparity_map.cols; ++u) {
-      float disparity = disparity_map.at<float>(v, u);
+  // Apply depth corrections
+  const double baseline = baseline_meters * baseline_scale;
+  const float disp_offset = static_cast<float>(disparity_offset);
+
+  // Pre-extract transform components for faster access (avoid Eigen overhead in loop)
+  const float r00 = combined_transform(0, 0), r01 = combined_transform(0, 1), r02 = combined_transform(0, 2), t0 = combined_transform(0, 3);
+  const float r10 = combined_transform(1, 0), r11 = combined_transform(1, 1), r12 = combined_transform(1, 2), t1 = combined_transform(1, 3);
+  const float r20 = combined_transform(2, 0), r21 = combined_transform(2, 1), r22 = combined_transform(2, 2), t2 = combined_transform(2, 3);
+
+  // Pre-compute constants
+  const float fx_baseline = static_cast<float>(fx * baseline);
+  const float inv_fx = static_cast<float>(1.0 / fx);
+  const float inv_fy = static_cast<float>(1.0 / fy);
+  const float cx_f = static_cast<float>(cx);
+  const float cy_f = static_cast<float>(cy);
+
+  const int rows = disparity_map.rows;
+  const int cols = disparity_map.cols;
+
+  // OpenMP parallel loop for multi-core acceleration
+  #pragma omp parallel for schedule(static)
+  for (int v = 0; v < rows; ++v) {
+    const float* disp_row = disparity_map.ptr<float>(v);
+    const float v_minus_cy = static_cast<float>(v) - cy_f;
+
+    for (int u = 0; u < cols; ++u) {
+      const float disparity = disp_row[u] - disp_offset;
       pcl::PointXYZ &point = cloud->at(u, v);
-      if (disparity > 0.0f) {
-        double Z = (fx * baseline) / disparity;
-        point.x = (u - cx) * Z / fx;
-        point.y = (v - cy) * Z / fy;
-        point.z = Z;
+
+      // Threshold slightly above zero to avoid divide-by-near-zero
+      if (disparity > 0.5f) {
+        // Compute point in rectified camera frame
+        const float Z = fx_baseline / disparity;
+        const float u_minus_cx = static_cast<float>(u) - cx_f;
+        const float X = u_minus_cx * Z * inv_fx;
+        const float Y = v_minus_cy * Z * inv_fy;
+
+        // Apply combined transform inline (rect_left -> cam0 -> centroid)
+        point.x = r00 * X + r01 * Y + r02 * Z + t0;
+        point.y = r10 * X + r11 * Y + r12 * Z + t1;
+        point.z = r20 * X + r21 * Y + r22 * Z + t2;
       } else {
         point.x = point.y = point.z = std::numeric_limits<float>::quiet_NaN();
       }
     }
   }
+
   return cloud;
 }
 

@@ -10,25 +10,8 @@ BASE_URL = f"https://github.com/lis-epfl/depth_estimation_ros2/releases/download
 
 # The specific S2M2 files you requested
 FILES_TO_DOWNLOAD = [
-    # S2M2 Medium variants
-    "S2M2_M_128_128_v2_torch29.onnx",
-    "S2M2_M_128_128_v2_torch29.onnx.data",
-    "S2M2_M_160_160_v2_torch29.onnx",
-    "S2M2_M_160_160_v2_torch29.onnx.data",
-    "S2M2_M_192_192_v2_torch29.onnx",
-    "S2M2_M_192_192_v2_torch29.onnx.data",
-    "S2M2_M_224_224_v2_torch29.onnx",
-    "S2M2_M_224_224_v2_torch29.onnx.data",
-
-    # S2M2 Small variants
-    "S2M2_S_128_128_v2_torch29.onnx",
-    "S2M2_S_128_128_v2_torch29.onnx.data",
-    "S2M2_S_160_160_v2_torch29.onnx",
-    "S2M2_S_160_160_v2_torch29.onnx.data",
-    "S2M2_S_192_192_v2_torch29.onnx",
-    "S2M2_S_192_192_v2_torch29.onnx.data",
-    "S2M2_S_224_224_v2_torch29.onnx",
-    "S2M2_S_224_224_v2_torch29.onnx.data"
+    "S2M2_S_256_160_v2_torch29.onnx",
+    "S2M2_S_256_160_v2_torch29.onnx.data"
 ]
 
 def progress_hook(count, block_size, total_size):

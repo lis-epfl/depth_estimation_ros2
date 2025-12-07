@@ -51,6 +51,24 @@ depth_estimation_node:
     # Recommended: 2-4 depending on CPU cores available
     num_pointcloud_workers: 2
 
+    # =====================================================
+    # DEPTH CORRECTION PARAMETERS
+    # =====================================================
+    # Depth corrections are loaded from the calibration folder:
+    #   <calibration_base_path>/final_maps_<resolution>/depth_corrections.yaml
+    #
+    # Example depth_corrections.yaml:
+    #   depth_correction:
+    #     baseline_scales: [1.07, 1.45, 0.92, 1.04]
+    #     disparity_offsets: [1.0, 0.5, -0.9, 1.0]
+    #
+    # Order matches stereo_pairs: ["0_1", "1_2", "2_3", "3_0"]
+    # If file is missing, defaults to no correction (scale=1.0, offset=0.0)
+
+    # --- Logging Parameters ---
+    # CSV columns: timestamp, preprocess_ms, inference_wall_ms,
+    #              then for each pair: rect_ms, infer_ms, cloud_ms, viz_ms
+
     # --- Logging Parameters ---
     # CSV columns: timestamp, preprocess_ms, inference_wall_ms,
     #              then for each pair: rect_ms, infer_ms, cloud_ms, viz_ms
