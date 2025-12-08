@@ -109,7 +109,7 @@ Two correction parameters are available:
 #### Equipment Needed
 - Motion capture system (Vicon, OptiTrack, etc.) OR accurate tape measure
 - Flat wall or target at known distances
-- Access to RViz2 for pointcloud visualization
+- Access to Foxglove (recommended) or RViz2 for pointcloud visualization
 
 #### Step-by-Step Calibration
 
@@ -123,12 +123,20 @@ Two correction parameters are available:
 
    # Terminal 3: Open RViz2
    rviz2
+   # Or if using Foxglove (use the correspoding ros domain id and open foxglove app):
+   ROS_DOMAIN_ID=0 ros2 launch foxglove_bridge foxglove_bridge_launch.xml
    ```
 
 2. **Configure RViz2**
    - Add PointCloud2 displays for each pair: `/depth/pointcloud/pair_0_1`, etc.
    - Set the fixed frame to match your `pointcloud_frame_id`
    - Use different colors for each pair to distinguish them
+
+   If using Foxglove:
+   - Add 3D panel.
+   - In `Frame` set the display frame to match your `pointcloud_frame_id`.
+   - In `Topics` you can choose the pointclouds to visualize and set different colors.
+
 
 3. **Collect measurements at multiple distances**
 
@@ -145,7 +153,7 @@ Two correction parameters are available:
 
    For each stereo pair and each distance:
    - **Ground truth**: Use mocap position or tape measure
-   - **Estimated**: Read from RViz2 (hover over pointcloud or use "Publish Point" tool)
+   - **Estimated**: Read from RViz2 (hover over pointcloud or use "Publish Point" tool). In Foxglove click on the ruler logo on the top right of the 3D panel to measure the exact distant.
 
    Example data format:
    ```
