@@ -10,7 +10,7 @@ This node processes a 4-camera concatenated stream into 3D point clouds using GP
 * **Parallel Processing:** Option to run inference on multiple stereo pairs concurrently using NVIDIA Multi-Stream or sequentially.
 * **Efficient Pipeline:** Handles image splitting, rectification, inference, and point cloud generation.
 * **Headless:** Publishes compressed debug imagery to ROS topics instead of GUI windows.
-* **Per-Drone Depth Corrections:** Support for calibration-specific baseline and disparity corrections.
+* **Per-Drone Depth Corrections:** Support for calibration-specific baseline and offset corrections.
 
 ## Prerequisites
 * **ROS 2 Humble** (or compatible)
@@ -80,29 +80,46 @@ compress_images: false
 
 Due to small errors in stereo calibration (baseline estimation, principal point alignment, rectification), the estimated depth may have systematic errors. This package supports per-drone corrections via a `depth_corrections.yaml` file in each calibration folder.
 
-### Understanding the Corrections
+### Mathematical Background
 
 The stereo depth equation is:
 ```
-Z = (f × B) / d
+Z = (f × b) / d
 ```
-Where `Z` is depth, `f` is focal length, `B` is baseline, and `d` is disparity.
+Where `Z` is depth, `f` is focal length, `b` is baseline, and `d` is disparity.
 
-Two correction parameters are available:
+Two types of systematic errors can occur:
+1. **Baseline/focal length error**: The effective `f×b` differs from calibration
+2. **Disparity offset error**: Systematic bias in disparity measurement
 
-| Parameter | Effect | When to Use |
-|-----------|--------|-------------|
-| `baseline_scale` | Multiplies the baseline: `Z_corrected = Z_original × scale` | Depth is consistently over/underestimated by a fixed percentage |
-| `disparity_offset` | Subtracts from disparity: `d_corrected = d - offset` | Error increases with distance (far objects have larger errors) |
+These errors combine to give a **linear relationship in inverse-depth space**:
+```
+1/Z_est = baseline_scale × (1/Z_real) + intercept
+```
 
-### Symptom Diagnosis
+### Correction Parameters
 
-| Observation | Likely Cause | Fix |
-|-------------|--------------|-----|
-| All depths too short (underestimate) | Baseline too small | `baseline_scale > 1.0` |
-| All depths too long (overestimate) | Baseline too large | `baseline_scale < 1.0` |
-| Near objects accurate, far objects wrong | Disparity offset | Adjust `disparity_offset` |
-| Error ratio (real/est) increases with distance | Combined error | Need both corrections |
+| Parameter | Meaning | How to obtain |
+|-----------|---------|---------------|
+| `baseline_scale` | Slope of linear fit in inverse-depth space | Directly from linear regression |
+| `offset_factor` | Negative intercept of linear fit | `offset_factor = -intercept` |
+
+**Correction formula:**
+```
+Z_corrected = baseline_scale × Z_est / (1 + offset_factor × Z_est)
+```
+
+**Key advantage:** Both parameters come directly from the linear fit — no need to know focal length or baseline separately!
+
+### Diagnosing Error Type
+
+Calculate the ratio `r = Z_real / Z_est` at multiple distances:
+
+| Ratio Pattern | Meaning | Correction Needed |
+|---------------|---------|-------------------|
+| Constant ratio at all distances | Pure baseline error | `baseline_scale` only (`offset_factor ≈ 0`) |
+| Ratio increases with distance | Underestimates at far range | Both parameters, `offset_factor > 0` |
+| Ratio decreases with distance | Overestimates at far range | Both parameters, `offset_factor < 0` |
 
 ### Measurement Procedure
 
@@ -123,7 +140,7 @@ Two correction parameters are available:
 
    # Terminal 3: Open RViz2
    rviz2
-   # Or if using Foxglove (use the correspoding ros domain id and open foxglove app):
+   # Or if using Foxglove (use the corresponding ros domain id and open foxglove app):
    ROS_DOMAIN_ID=0 ros2 launch foxglove_bridge foxglove_bridge_launch.xml
    ```
 
@@ -137,93 +154,66 @@ Two correction parameters are available:
    - In `Frame` set the display frame to match your `pointcloud_frame_id`.
    - In `Topics` you can choose the pointclouds to visualize and set different colors.
 
-
 3. **Collect measurements at multiple distances**
 
-   Position a flat surface (wall) at known distances from the camera. For each distance:
+   Position a flat surface (wall) at known distances from the camera. **Minimum 2 distances required** (more recommended for verification):
 
-   | Distance | Why |
-   |----------|-----|
-   | ~1.2m | Near range reference |
+   | Distance | Purpose |
+   |----------|---------|
+   | ~1.5m | Near range reference |
    | ~2.5m | Mid range |
    | ~3.5m | Mid-far range |
-   | ~4.5m+ | Far range (most sensitive to disparity offset) |
+   | ~4.5m+ | Far range (most sensitive to offset errors) |
 
 4. **Record ground truth and estimated depths**
 
    For each stereo pair and each distance:
-   - **Ground truth**: Use mocap position or tape measure
-   - **Estimated**: Read from RViz2 (hover over pointcloud or use "Publish Point" tool). In Foxglove click on the ruler logo on the top right of the 3D panel to measure the exact distant.
+   - **Ground truth (Z_real)**: Use mocap position or tape measure
+   - **Estimated (Z_est)**: Read from RViz2 (hover over pointcloud or use "Publish Point" tool). In Foxglove click on the ruler logo on the top right of the 3D panel to measure the exact distance.
 
    Example data format:
    ```
-   Distance | Real (m) | Pair 0_1 | Pair 1_2 | Pair 2_3 | Pair 3_0
-   ---------|----------|----------|----------|----------|----------
-   Near     | 1.20     | 1.04     | 0.90     | 1.18     | 1.05
-   Mid      | 2.45     | 2.00     | 1.60     | 2.40     | 2.00
-   Mid-far  | 3.61     | 2.76     | 2.06     | 3.61     | 2.79
-   Far      | 4.60     | 3.27     | 2.33     | 4.60     | 3.54
+   Z_real (m) | Pair 0_1 | Pair 1_2 | Pair 2_3 | Pair 3_0
+   -----------|----------|----------|----------|----------
+   1.85       | 1.82     | 1.70     | 1.90     | 1.80
+   3.70       | 3.68     | 3.07     | 4.11     | 3.75
    ```
 
-5. **Analyze the error pattern**
+5. **Run the calibration script**
 
-   Calculate the ratio `Real / Estimated` for each measurement:
-
-   ```
-   Distance | Pair 0_1 Ratio | Pair 1_2 Ratio | ...
-   ---------|----------------|----------------|----
-   Near     | 1.15           | 1.33           |
-   Mid      | 1.23           | 1.53           |
-   Mid-far  | 1.31           | 1.75           |
-   Far      | 1.41           | 1.97           |
+   Use the provided calibration script:
+   ```bash
+   python3 scripts/depth_calibration.py
    ```
 
-   - **Constant ratio** → Only `baseline_scale` needed (= average ratio)
-   - **Increasing ratio with distance** → Both corrections needed
+   The script will:
+   - Prompt for your measurements
+   - Fit the linear model in inverse-depth space
+   - Output `baseline_scale` and `offset_factor` for each pair
+   - Verify the correction produces accurate depths
+   - Generate the YAML configuration
 
-6. **Calculate correction parameters**
+6. **Create the corrections file**
 
-   **Simple case (constant ratio):**
-   ```
-   baseline_scale = average(Real / Estimated)
-   disparity_offset = 0.0
-   ```
-
-   **Complex case (ratio increases with distance):**
-
-   The error model in inverse-depth space is linear:
-   ```
-   1/Z_est = (1/baseline_scale) × (1/Z_real) + offset_factor
-   ```
-
-   Fit this linear model to your data points `(1/Z_real, 1/Z_est)` to get:
-   - `baseline_scale` from the slope
-   - `disparity_offset` from the intercept (requires knowing focal length)
-
-   **Practical approximation:**
-   - Start with `baseline_scale = ratio at near distance`
-   - Adjust `disparity_offset` until far distance is correct
-   - Iterate if needed
-
-7. **Create the corrections file**
-
-   Create `depth_corrections.yaml` in your calibration folder:
+   Save the output as `depth_corrections.yaml` in your calibration folder:
    ```yaml
    # config/final_maps_256_160/depth_corrections.yaml
+   # Correction: Z_corrected = baseline_scale * Z_est / (1 + offset_factor * Z_est)
+
    depth_correction:
      # Order matches stereo_pairs: ["0_1", "1_2", "2_3", "3_0"]
-     baseline_scales: [1.07, 1.45, 0.92, 1.04]
-     disparity_offsets: [1.0, 0.5, -0.9, 1.0]
+     baseline_scales: [1.027532, 0.971259, 1.047125, 1.068889]
+     offset_factors: [0.005972, -0.063231, 0.039698, 0.022222]
    ```
 
-8. **Verify corrections**
+7. **Verify corrections**
 
    Restart the depth estimation node and repeat measurements to verify accuracy.
 
 ### Correction Parameter Reference
 
-| Scenario | `baseline_scale` | `disparity_offset` |
-|----------|----------------|------------------|
+| Scenario | `baseline_scale` | `offset_factor` |
+|----------|------------------|-----------------|
 | Depths too short (underestimate) | > 1.0 | > 0 (if error grows with distance) |
 | Depths too long (overestimate) | < 1.0 | < 0 (if error grows with distance) |
 | No correction needed | 1.0 | 0.0 |
@@ -268,3 +258,8 @@ ros2 launch depth_estimation_ros2 depth_estimation.launch.py
 - That pair likely has calibration issues
 - Consider re-running stereo calibration for that pair
 - Use larger correction values for that specific pair
+
+### Correction doesn't improve accuracy
+- Verify you have at least 2 distance measurements
+- Check that the linear model assumption holds (errors should follow pattern described above)
+- Try adding more measurement points to verify fit quality

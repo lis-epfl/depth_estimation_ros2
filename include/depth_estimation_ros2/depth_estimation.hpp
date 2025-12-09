@@ -46,8 +46,9 @@ struct StereoPairData {
   Eigen::Matrix4f transform_rect_left_to_cam0;
 
   // --- DEPTH CORRECTION PARAMETERS ---
-  double baseline_scale;      // Multiplier for baseline (default: 1.0)
-  double disparity_offset;    // Pixels to subtract from disparity (default: 0.0)
+  // Correction formula: Z_corrected = baseline_scale * Z_raw / (1 + offset_factor * Z_raw)
+  double baseline_scale;      // Slope from linear fit in inverse-depth space (default: 1.0)
+  double offset_factor;       // Negative intercept from linear fit (default: 0.0)
 };
 
 // Struct to hold results from inference (main thread)
@@ -75,8 +76,9 @@ struct DisparityPayload {
     Eigen::Matrix4f transform_rect_left_to_cam0;
 
     // --- DEPTH CORRECTION PARAMETERS ---
-    double baseline_scale;      // Multiplier for baseline
-    double disparity_offset;    // Pixels to subtract from disparity
+    // Correction formula: Z_corrected = baseline_scale * Z_raw / (1 + offset_factor * Z_raw)
+    double baseline_scale;      // Slope from linear fit
+    double offset_factor;       // Negative intercept from linear fit
 };
 
 // Struct for aggregating combined pointcloud per frame
@@ -159,7 +161,7 @@ private:
                         const cv::Mat &K_rect_left,
                         double baseline_meters,
                         double baseline_scale,
-                        double disparity_offset,
+                        double offset_factor,
                         const Eigen::Matrix4f &combined_transform);
 
   // Async pointcloud processing

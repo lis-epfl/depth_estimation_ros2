@@ -164,7 +164,7 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
       payload.K_rect_left,
       payload.baseline_meters,
       payload.baseline_scale,
-      payload.disparity_offset,
+      payload.offset_factor,
       combined_transform);
 
   cloud_time_ms = std::chrono::duration<double, std::milli>(
@@ -762,7 +762,7 @@ void DepthEstimation::InitializeCalibrationData() {
   // --- LOAD DEPTH CORRECTIONS FROM FILE ---
   std::string depth_corrections_path = calibration_dir + "/depth_corrections.yaml";
   std::vector<double> baseline_scales;
-  std::vector<double> disparity_offsets;
+  std::vector<double> offset_factors;
 
   if (std::filesystem::exists(depth_corrections_path)) {
     RCLCPP_INFO(this->get_logger(), "Loading depth corrections from: %s", depth_corrections_path.c_str());
@@ -773,8 +773,8 @@ void DepthEstimation::InitializeCalibrationData() {
         if (corrections["depth_correction"]["baseline_scales"]) {
           baseline_scales = corrections["depth_correction"]["baseline_scales"].as<std::vector<double>>();
         }
-        if (corrections["depth_correction"]["disparity_offsets"]) {
-          disparity_offsets = corrections["depth_correction"]["disparity_offsets"].as<std::vector<double>>();
+        if (corrections["depth_correction"]["offset_factors"]) {
+          offset_factors = corrections["depth_correction"]["offset_factors"].as<std::vector<double>>();
         }
       }
     } catch (const std::exception& e) {
@@ -795,20 +795,21 @@ void DepthEstimation::InitializeCalibrationData() {
     baseline_scales.assign(stereo_pairs_.size(), 1.0);
   }
 
-  if (disparity_offsets.size() != stereo_pairs_.size()) {
-    if (!disparity_offsets.empty()) {
+  if (offset_factors.size() != stereo_pairs_.size()) {
+    if (!offset_factors.empty()) {
       RCLCPP_WARN(this->get_logger(),
-                  "disparity_offsets size (%zu) doesn't match stereo_pairs size (%zu). Using default 0.0.",
-                  disparity_offsets.size(), stereo_pairs_.size());
+                  "offset_factors size (%zu) doesn't match stereo_pairs size (%zu). Using default 0.0.",
+                  offset_factors.size(), stereo_pairs_.size());
     }
-    disparity_offsets.assign(stereo_pairs_.size(), 0.0);
+    offset_factors.assign(stereo_pairs_.size(), 0.0);
   }
 
   // Log depth correction parameters
   RCLCPP_INFO(this->get_logger(), "=== DEPTH CORRECTION PARAMETERS ===");
+  RCLCPP_INFO(this->get_logger(), "Formula: Z_corrected = baseline_scale * Z_raw / (1 + offset_factor * Z_raw)");
   for (size_t i = 0; i < stereo_pairs_.size(); ++i) {
-    RCLCPP_INFO(this->get_logger(), "  Pair %s: baseline_scale=%.4f, disparity_offset=%.4f",
-                stereo_pairs_[i].c_str(), baseline_scales[i], disparity_offsets[i]);
+    RCLCPP_INFO(this->get_logger(), "  Pair %s: baseline_scale=%.6f, offset_factor=%.6f",
+                stereo_pairs_[i].c_str(), baseline_scales[i], offset_factors[i]);
   }
 
   // --- LOAD PER-PAIR CALIBRATION DATA ---
@@ -843,10 +844,10 @@ void DepthEstimation::InitializeCalibrationData() {
 
     // --- ASSIGN DEPTH CORRECTION PARAMETERS FOR THIS PAIR ---
     data.baseline_scale = baseline_scales[pair_idx];
-    data.disparity_offset = disparity_offsets[pair_idx];
+    data.offset_factor = offset_factors[pair_idx];
 
-    RCLCPP_INFO(this->get_logger(), "Loaded pair %s: baseline=%.6f m, scale=%.4f, offset=%.4f px",
-                pair_str.c_str(), data.baseline_meters, data.baseline_scale, data.disparity_offset);
+    RCLCPP_INFO(this->get_logger(), "Loaded pair %s: baseline=%.6f m, scale=%.6f, offset_factor=%.6f",
+                pair_str.c_str(), data.baseline_meters, data.baseline_scale, data.offset_factor);
 
     calibration_data_[pair_str] = data;
   }
@@ -1055,7 +1056,7 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
 
       // --- COPY DEPTH CORRECTION PARAMETERS ---
       payload.baseline_scale = pair_data.baseline_scale;
-      payload.disparity_offset = pair_data.disparity_offset;
+      payload.offset_factor = pair_data.offset_factor;
 
       EnqueueDisparity(std::move(payload));
 
@@ -1235,13 +1236,14 @@ cv::Mat DepthEstimation::RunInference(const cv::Mat &rectified_left,
 // - Single memory allocation
 // - Combined transform applied inline
 // - OpenMP parallelization for multi-core speedup
+// - Depth correction: Z_corrected = baseline_scale * Z_raw / (1 + offset_factor * Z_raw)
 // =============================================================================
 pcl::PointCloud<pcl::PointXYZ>::Ptr
 DepthEstimation::DisparityToPointCloud(const cv::Mat &disparity_map,
                                         const cv::Mat &K_rect_left,
                                         double baseline_meters,
                                         double baseline_scale,
-                                        double disparity_offset,
+                                        double offset_factor,
                                         const Eigen::Matrix4f &combined_transform) {
   auto cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
   cloud->width = disparity_map.cols;
@@ -1255,21 +1257,21 @@ DepthEstimation::DisparityToPointCloud(const cv::Mat &disparity_map,
   const double cx = K_rect_left.at<double>(0, 2);
   const double cy = K_rect_left.at<double>(1, 2);
 
-  // Apply depth corrections
-  const double baseline = baseline_meters * baseline_scale;
-  const float disp_offset = static_cast<float>(disparity_offset);
-
   // Pre-extract transform components for faster access (avoid Eigen overhead in loop)
   const float r00 = combined_transform(0, 0), r01 = combined_transform(0, 1), r02 = combined_transform(0, 2), t0 = combined_transform(0, 3);
   const float r10 = combined_transform(1, 0), r11 = combined_transform(1, 1), r12 = combined_transform(1, 2), t1 = combined_transform(1, 3);
   const float r20 = combined_transform(2, 0), r21 = combined_transform(2, 1), r22 = combined_transform(2, 2), t2 = combined_transform(2, 3);
 
-  // Pre-compute constants
-  const float fx_baseline = static_cast<float>(fx * baseline);
+  // Pre-compute constants for raw depth calculation
+  const float fx_baseline = static_cast<float>(fx * baseline_meters);
   const float inv_fx = static_cast<float>(1.0 / fx);
   const float inv_fy = static_cast<float>(1.0 / fy);
   const float cx_f = static_cast<float>(cx);
   const float cy_f = static_cast<float>(cy);
+
+  // Depth correction parameters
+  const float bs = static_cast<float>(baseline_scale);
+  const float of = static_cast<float>(offset_factor);
 
   const int rows = disparity_map.rows;
   const int cols = disparity_map.cols;
@@ -1281,18 +1283,24 @@ DepthEstimation::DisparityToPointCloud(const cv::Mat &disparity_map,
     const float v_minus_cy = static_cast<float>(v) - cy_f;
 
     for (int u = 0; u < cols; ++u) {
-      const float disparity = disp_row[u] - disp_offset;
+      const float disparity = disp_row[u];
       pcl::PointXYZ &point = cloud->at(u, v);
 
       // Threshold slightly above zero to avoid divide-by-near-zero
       if (disparity > 0.5f) {
-        // Compute point in rectified camera frame
-        const float Z = fx_baseline / disparity;
+        // Step 1: Compute raw (uncorrected) depth from disparity
+        const float Z_raw = fx_baseline / disparity;
+
+        // Step 2: Apply depth correction formula:
+        // Z_corrected = baseline_scale * Z_raw / (1 + offset_factor * Z_raw)
+        const float Z = bs * Z_raw / (1.0f + of * Z_raw);
+
+        // Step 3: Compute X, Y using corrected depth
         const float u_minus_cx = static_cast<float>(u) - cx_f;
         const float X = u_minus_cx * Z * inv_fx;
         const float Y = v_minus_cy * Z * inv_fy;
 
-        // Apply combined transform inline (rect_left -> cam0 -> centroid)
+        // Step 4: Apply combined transform inline (rect_left -> cam0 -> centroid)
         point.x = r00 * X + r01 * Y + r02 * Z + t0;
         point.y = r10 * X + r11 * Y + r12 * Z + t1;
         point.z = r20 * X + r21 * Y + r22 * Z + t2;
