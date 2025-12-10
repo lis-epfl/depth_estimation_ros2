@@ -276,7 +276,6 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
 
   // --- VISUALIZATION (if verbose) ---
   cv::Mat display_image;
-  double viz_time_ms = 0.0;
   if (payload.verbose) {
     auto t_start_viz = std::chrono::high_resolution_clock::now();
 
