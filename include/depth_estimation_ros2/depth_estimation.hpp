@@ -118,6 +118,11 @@ struct FrameTimingData {
     std::atomic<int> pairs_completed{0};
     std::mutex timing_mutex;
 
+    // NEW: Combined cloud and total timing
+    double combined_publish_ms{0.0};  // Time to assemble and publish combined cloud
+    double max_cloud_ms{0.0};         // Max of all cloud times (actual latency)
+    std::chrono::high_resolution_clock::time_point callback_start;  // For total wall time
+
     FrameTimingData() = default;
 };
 

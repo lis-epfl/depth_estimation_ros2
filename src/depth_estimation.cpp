@@ -252,11 +252,35 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
     int count = aggregator->pairs_received.fetch_add(1) + 1;
 
     if (count == static_cast<int>(stereo_pairs_.size())) {
+      // Time the combined cloud assembly and publish
+      auto t_start_combine = std::chrono::high_resolution_clock::now();
+
       auto combined_pc_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
       pcl::toROSMsg(*aggregator->combined_cloud, *combined_pc_msg);
       combined_pc_msg->header = aggregator->header;
       combined_pc_msg->header.frame_id = pointcloud_frame_id_;
       combined_pointcloud_pub_->publish(std::move(combined_pc_msg));
+
+      auto t_end_combine = std::chrono::high_resolution_clock::now();
+      double combined_publish_ms = std::chrono::duration<double, std::milli>(
+          t_end_combine - t_start_combine).count();
+
+      // Record combined timing
+      {
+        std::lock_guard<std::mutex> lock(timing_data_mutex_);
+        auto it = frame_timing_data_.find(payload.frame_id);
+        if (it != frame_timing_data_.end()) {
+          std::lock_guard<std::mutex> timing_lock(it->second->timing_mutex);
+          it->second->combined_publish_ms = combined_publish_ms;
+
+          // Calculate max cloud time
+          double max_cloud = 0.0;
+          for (const auto& ct : it->second->cloud_times) {
+            max_cloud = std::max(max_cloud, ct.second);
+          }
+          it->second->max_cloud_ms = max_cloud;
+        }
+      }
 
       {
         std::lock_guard<std::mutex> lock(aggregator_mutex_);
@@ -384,6 +408,7 @@ void DepthEstimation::PrintFrameTimingReport(uint64_t frame_id) {
   report << "Inference Wall: " << timing_data->inference_wall_ms << " ms\n";
 
   double total_cloud_ms = 0.0;
+  double max_cloud_ms = 0.0;
   double total_viz_ms = 0.0;
 
   for (const auto& pair_name : stereo_pairs_) {
@@ -401,15 +426,25 @@ void DepthEstimation::PrintFrameTimingReport(uint64_t frame_id) {
     report << " ms\n";
 
     total_cloud_ms += cloud_ms;
+    max_cloud_ms = std::max(max_cloud_ms, cloud_ms);
     total_viz_ms += viz_ms;
   }
 
   report << "--------------------------------\n";
-  report << "Total Cloud: " << total_cloud_ms << " ms";
+  report << "Max Cloud: " << max_cloud_ms << " ms";
+  if (publish_combined_pointcloud_) {
+    report << " | Combined Publish: " << timing_data->combined_publish_ms << " ms";
+  }
   if (verbose_) {
     report << " | Total Viz: " << total_viz_ms << " ms";
   }
   report << "\n";
+
+  // Calculate and show total wall time
+  auto t_now = std::chrono::high_resolution_clock::now();
+  double total_wall_ms = std::chrono::duration<double, std::milli>(
+      t_now - timing_data->callback_start).count();
+  report << "TOTAL WALL TIME: " << total_wall_ms << " ms\n";
   report << "INFERENCE FPS: " << (1000.0 / timing_data->inference_wall_ms);
 
   RCLCPP_INFO(this->get_logger(), "%s", report.str().c_str());
@@ -436,6 +471,14 @@ void DepthEstimation::LogFrameTiming(uint64_t frame_id) {
                << std::setprecision(3) << timing_data->preprocess_ms << ","
                << timing_data->inference_wall_ms;
 
+  // Calculate max cloud time if not already set
+  double max_cloud_ms = timing_data->max_cloud_ms;
+  if (max_cloud_ms == 0.0) {
+    for (const auto& ct : timing_data->cloud_times) {
+      max_cloud_ms = std::max(max_cloud_ms, ct.second);
+    }
+  }
+
   for (const auto& pair_name : stereo_pairs_) {
     double rect_ms = timing_data->rect_times.count(pair_name) ? timing_data->rect_times[pair_name] : 0.0;
     double infer_ms = timing_data->infer_times.count(pair_name) ? timing_data->infer_times[pair_name] : 0.0;
@@ -444,6 +487,16 @@ void DepthEstimation::LogFrameTiming(uint64_t frame_id) {
 
     timing_file_ << "," << rect_ms << "," << infer_ms << "," << cloud_ms << "," << viz_ms;
   }
+
+  // Calculate total wall time from callback start to now
+  auto t_now = std::chrono::high_resolution_clock::now();
+  double total_wall_ms = std::chrono::duration<double, std::milli>(
+      t_now - timing_data->callback_start).count();
+
+  // NEW COLUMNS: max_cloud_ms, combined_publish_ms, total_wall_ms
+  timing_file_ << "," << max_cloud_ms
+               << "," << timing_data->combined_publish_ms
+               << "," << total_wall_ms;
 
   timing_file_ << "\n";
   timing_file_.flush();
@@ -585,7 +638,7 @@ void DepthEstimation::InitializeLogging() {
       return;
     }
 
-    // Write Header
+    // Write Header - includes new columns for combined cloud timing
     timing_file_ << "timestamp,preprocess_ms,inference_wall_ms";
     for (const auto& pair : stereo_pairs_) {
       timing_file_ << "," << pair << "_rect_ms"
@@ -593,7 +646,8 @@ void DepthEstimation::InitializeLogging() {
                    << "," << pair << "_cloud_ms"
                    << "," << pair << "_viz_ms";
     }
-    timing_file_ << "\n";
+    // NEW COLUMNS: max_cloud_ms, combined_publish_ms, total_wall_ms
+    timing_file_ << ",max_cloud_ms,combined_publish_ms,total_wall_ms\n";
 
     RCLCPP_INFO(this->get_logger(), "Logging timing data to: %s", filename.c_str());
 
@@ -953,6 +1007,7 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
   auto timing_data = std::make_shared<FrameTimingData>();
   timing_data->header = header;
   timing_data->preprocess_ms = preprocessing_ms;
+  timing_data->callback_start = t_start_total;  // Store callback start time for total wall time
 
   {
     std::lock_guard<std::mutex> lock(timing_data_mutex_);
