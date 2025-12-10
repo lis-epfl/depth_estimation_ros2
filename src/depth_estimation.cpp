@@ -256,7 +256,30 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
       auto t_start_combine = std::chrono::high_resolution_clock::now();
 
       auto combined_pc_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-      pcl::toROSMsg(*aggregator->combined_cloud, *combined_pc_msg);
+
+      // OPTIMIZED: Use pre-allocated template + parallel copy instead of pcl::toROSMsg
+      // pcl::toROSMsg is slow because it converts from 16-byte PointXYZ (SSE-aligned) to 12-byte format
+      if (combined_msg_initialized_) {
+        // Copy template structure (fields, dimensions, etc.)
+        *combined_pc_msg = combined_pc_msg_template_;
+
+        // Fast parallel copy from PCL (16-byte aligned) to ROS (12-byte packed)
+        const size_t num_points = aggregator->combined_cloud->points.size();
+        float* dst = reinterpret_cast<float*>(combined_pc_msg->data.data());
+        const pcl::PointXYZ* src = aggregator->combined_cloud->points.data();
+
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < num_points; ++i) {
+          const size_t dst_idx = i * 3;
+          dst[dst_idx + 0] = src[i].x;
+          dst[dst_idx + 1] = src[i].y;
+          dst[dst_idx + 2] = src[i].z;
+        }
+      } else {
+        // Fallback to pcl::toROSMsg if template not initialized
+        pcl::toROSMsg(*aggregator->combined_cloud, *combined_pc_msg);
+      }
+
       combined_pc_msg->header = aggregator->header;
       combined_pc_msg->header.frame_id = pointcloud_frame_id_;
       combined_pointcloud_pub_->publish(std::move(combined_pc_msg));
@@ -904,6 +927,31 @@ void DepthEstimation::InitializeCalibrationData() {
                 pair_str.c_str(), data.baseline_meters, data.baseline_scale, data.offset_factor);
 
     calibration_data_[pair_str] = data;
+  }
+
+  // Initialize combined pointcloud message template for fast publishing
+  if (publish_combined_pointcloud_ && !calibration_data_.empty()) {
+    const auto &first_pair_data = calibration_data_.at(stereo_pairs_[0]);
+    size_t total_points = stereo_pairs_.size() * first_pair_data.resolution.width * first_pair_data.resolution.height;
+
+    combined_pc_msg_template_.height = 1;
+    combined_pc_msg_template_.width = total_points;
+    combined_pc_msg_template_.is_dense = false;
+    combined_pc_msg_template_.is_bigendian = false;
+
+    // Set up fields (x, y, z) - 12 bytes per point
+    sensor_msgs::msg::PointField field_x, field_y, field_z;
+    field_x.name = "x"; field_x.offset = 0; field_x.datatype = sensor_msgs::msg::PointField::FLOAT32; field_x.count = 1;
+    field_y.name = "y"; field_y.offset = 4; field_y.datatype = sensor_msgs::msg::PointField::FLOAT32; field_y.count = 1;
+    field_z.name = "z"; field_z.offset = 8; field_z.datatype = sensor_msgs::msg::PointField::FLOAT32; field_z.count = 1;
+    combined_pc_msg_template_.fields = {field_x, field_y, field_z};
+    combined_pc_msg_template_.point_step = 12;  // 3 floats * 4 bytes
+    combined_pc_msg_template_.row_step = 12 * total_points;
+    combined_pc_msg_template_.data.resize(combined_pc_msg_template_.row_step);
+
+    combined_msg_initialized_ = true;
+    RCLCPP_INFO(this->get_logger(), "Pre-allocated combined PointCloud2 message for %zu points (%zu bytes)",
+                total_points, combined_pc_msg_template_.row_step);
   }
 }
 

@@ -251,6 +251,10 @@ private:
   std::map<uint64_t, std::shared_ptr<FrameCloudAggregator>> frame_aggregators_;
   std::mutex aggregator_mutex_;
 
+  // Pre-allocated PointCloud2 template for fast publishing (avoids pcl::toROSMsg overhead)
+  sensor_msgs::msg::PointCloud2 combined_pc_msg_template_;
+  bool combined_msg_initialized_ = false;
+
   // --- Debug Grid (for verbose mode) ---
   std::mutex debug_grid_mutex_;
   std::map<uint64_t, std::vector<std::pair<std::string, cv::Mat>>> frame_debug_images_;
