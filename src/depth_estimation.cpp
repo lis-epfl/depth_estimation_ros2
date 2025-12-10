@@ -152,26 +152,131 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
   double cloud_time_ms = 0.0;
   double viz_time_ms = 0.0;
 
-  // --- POINTCLOUD GENERATION (OPTIMIZED: single loop with combined transform) ---
+  // --- POINTCLOUD GENERATION ---
   auto t_start_cloud = std::chrono::high_resolution_clock::now();
 
   // Pre-compute combined transform: centroid <- cam0 <- rect_left
   Eigen::Matrix4f combined_transform = transform_cam0_to_centroid_ * payload.transform_rect_left_to_cam0;
 
-  // Single function call with combined transform - no separate transformPointCloud calls
-  auto transformed_cloud = DisparityToPointCloud(
-      payload.disparity_map,
-      payload.K_rect_left,
-      payload.baseline_meters,
-      payload.baseline_scale,
-      payload.offset_factor,
-      combined_transform);
+  // For combined mode: write directly to PointCloud2 buffer (skip PCL intermediate)
+  // For individual mode: use PCL cloud
+  pcl::PointCloud<pcl::PointXYZ>::Ptr transformed_cloud;
 
-  cloud_time_ms = std::chrono::duration<double, std::milli>(
-      std::chrono::high_resolution_clock::now() - t_start_cloud).count();
+  if (publish_combined_pointcloud_) {
+    // Get aggregator and write directly to its PointCloud2 buffer
+    std::shared_ptr<FrameCloudAggregator> aggregator;
+    {
+      std::lock_guard<std::mutex> lock(aggregator_mutex_);
+      auto it = frame_aggregators_.find(payload.frame_id);
+      if (it == frame_aggregators_.end()) {
+        // Aggregator not yet created - create it now
+        size_t points_per_pair = payload.resolution.width * payload.resolution.height;
+        auto new_aggregator = std::make_shared<FrameCloudAggregator>(stereo_pairs_.size(), points_per_pair, pointcloud_frame_id_);
+        new_aggregator->header = payload.header;
+        frame_aggregators_[payload.frame_id] = new_aggregator;
+        aggregator = new_aggregator;
+      } else {
+        aggregator = it->second;
+      }
+    }
+
+    // Write directly to PointCloud2 buffer (12-byte packed format)
+    float* dst = aggregator->GetPairDataPtr(payload.pair_index);
+    DisparityToPointCloud2Direct(
+        payload.disparity_map,
+        payload.K_rect_left,
+        payload.baseline_meters,
+        payload.baseline_scale,
+        payload.offset_factor,
+        combined_transform,
+        dst);
+
+    cloud_time_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t_start_cloud).count();
+
+    // Record timing
+    {
+      std::lock_guard<std::mutex> lock(timing_data_mutex_);
+      auto it = frame_timing_data_.find(payload.frame_id);
+      if (it != frame_timing_data_.end()) {
+        std::lock_guard<std::mutex> timing_lock(it->second->timing_mutex);
+        it->second->cloud_times[payload.pair_name] = cloud_time_ms;
+      }
+    }
+
+    // Check if all pairs are done
+    int count = aggregator->pairs_received.fetch_add(1) + 1;
+
+    if (count == static_cast<int>(stereo_pairs_.size())) {
+      // All pairs done - publish directly (no conversion needed!)
+      auto t_start_combine = std::chrono::high_resolution_clock::now();
+
+      aggregator->combined_msg.header = aggregator->header;
+      aggregator->combined_msg.header.frame_id = pointcloud_frame_id_;
+
+      // Just move the pre-filled message - no pcl::toROSMsg needed!
+      auto msg_to_publish = std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(aggregator->combined_msg));
+      combined_pointcloud_pub_->publish(std::move(msg_to_publish));
+
+      auto t_end_combine = std::chrono::high_resolution_clock::now();
+      double combined_publish_ms = std::chrono::duration<double, std::milli>(
+          t_end_combine - t_start_combine).count();
+
+      // Record combined timing
+      {
+        std::lock_guard<std::mutex> lock(timing_data_mutex_);
+        auto it = frame_timing_data_.find(payload.frame_id);
+        if (it != frame_timing_data_.end()) {
+          std::lock_guard<std::mutex> timing_lock(it->second->timing_mutex);
+          it->second->combined_publish_ms = combined_publish_ms;
+
+          double max_cloud = 0.0;
+          for (const auto& ct : it->second->cloud_times) {
+            max_cloud = std::max(max_cloud, ct.second);
+          }
+          it->second->max_cloud_ms = max_cloud;
+        }
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(aggregator_mutex_);
+        frame_aggregators_.erase(payload.frame_id);
+      }
+    }
+  } else {
+    // Individual pointcloud mode - use original PCL approach
+    transformed_cloud = DisparityToPointCloud(
+        payload.disparity_map,
+        payload.K_rect_left,
+        payload.baseline_meters,
+        payload.baseline_scale,
+        payload.offset_factor,
+        combined_transform);
+
+    cloud_time_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::high_resolution_clock::now() - t_start_cloud).count();
+
+    // Record timing
+    {
+      std::lock_guard<std::mutex> lock(timing_data_mutex_);
+      auto it = frame_timing_data_.find(payload.frame_id);
+      if (it != frame_timing_data_.end()) {
+        std::lock_guard<std::mutex> timing_lock(it->second->timing_mutex);
+        it->second->cloud_times[payload.pair_name] = cloud_time_ms;
+      }
+    }
+
+    // Publish individual pointcloud
+    auto pc_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
+    pcl::toROSMsg(*transformed_cloud, *pc_msg);
+    pc_msg->header = payload.header;
+    pc_msg->header.frame_id = pointcloud_frame_id_;
+    pointcloud_pubs_[payload.pair_name]->publish(std::move(pc_msg));
+  }
 
   // --- VISUALIZATION (if verbose) ---
   cv::Mat display_image;
+  double viz_time_ms = 0.0;
   if (payload.verbose) {
     auto t_start_viz = std::chrono::high_resolution_clock::now();
 
@@ -206,116 +311,16 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
 
     viz_time_ms = std::chrono::duration<double, std::milli>(
         std::chrono::high_resolution_clock::now() - t_start_viz).count();
-  }
 
-  // --- RECORD TIMING ---
-  {
-    std::lock_guard<std::mutex> lock(timing_data_mutex_);
-    auto it = frame_timing_data_.find(payload.frame_id);
-    if (it != frame_timing_data_.end()) {
-      std::lock_guard<std::mutex> timing_lock(it->second->timing_mutex);
-      it->second->cloud_times[payload.pair_name] = cloud_time_ms;
-      it->second->viz_times[payload.pair_name] = viz_time_ms;
-    }
-  }
-
-  // --- PUBLISH POINTCLOUD ---
-  if (publish_combined_pointcloud_) {
-    std::shared_ptr<FrameCloudAggregator> aggregator;
-
+    // Record viz timing
     {
-      std::lock_guard<std::mutex> lock(aggregator_mutex_);
-      auto it = frame_aggregators_.find(payload.frame_id);
-      if (it == frame_aggregators_.end()) {
-        // Aggregator not yet created - create it now (handles race condition at startup)
-        size_t points_per_pair = payload.resolution.width * payload.resolution.height;
-        auto new_aggregator = std::make_shared<FrameCloudAggregator>(stereo_pairs_.size(), points_per_pair);
-        new_aggregator->header = payload.header;
-        frame_aggregators_[payload.frame_id] = new_aggregator;
-        aggregator = new_aggregator;
-      } else {
-        aggregator = it->second;
+      std::lock_guard<std::mutex> lock(timing_data_mutex_);
+      auto it = frame_timing_data_.find(payload.frame_id);
+      if (it != frame_timing_data_.end()) {
+        std::lock_guard<std::mutex> timing_lock(it->second->timing_mutex);
+        it->second->viz_times[payload.pair_name] = viz_time_ms;
       }
     }
-
-    // Direct memory copy to pre-allocated offset (no reallocation!)
-    {
-      const size_t offset = payload.pair_index * aggregator->points_per_pair;
-      const size_t num_points = transformed_cloud->points.size();
-
-      // Copy points directly to the pre-allocated region
-      std::memcpy(&aggregator->combined_cloud->points[offset],
-                  transformed_cloud->points.data(),
-                  num_points * sizeof(pcl::PointXYZ));
-    }
-
-    int count = aggregator->pairs_received.fetch_add(1) + 1;
-
-    if (count == static_cast<int>(stereo_pairs_.size())) {
-      // Time the combined cloud assembly and publish
-      auto t_start_combine = std::chrono::high_resolution_clock::now();
-
-      auto combined_pc_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-
-      // OPTIMIZED: Use pre-allocated template + parallel copy instead of pcl::toROSMsg
-      // pcl::toROSMsg is slow because it converts from 16-byte PointXYZ (SSE-aligned) to 12-byte format
-      if (combined_msg_initialized_) {
-        // Copy template structure (fields, dimensions, etc.)
-        *combined_pc_msg = combined_pc_msg_template_;
-
-        // Fast parallel copy from PCL (16-byte aligned) to ROS (12-byte packed)
-        const size_t num_points = aggregator->combined_cloud->points.size();
-        float* dst = reinterpret_cast<float*>(combined_pc_msg->data.data());
-        const pcl::PointXYZ* src = aggregator->combined_cloud->points.data();
-
-        #pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < num_points; ++i) {
-          const size_t dst_idx = i * 3;
-          dst[dst_idx + 0] = src[i].x;
-          dst[dst_idx + 1] = src[i].y;
-          dst[dst_idx + 2] = src[i].z;
-        }
-      } else {
-        // Fallback to pcl::toROSMsg if template not initialized
-        pcl::toROSMsg(*aggregator->combined_cloud, *combined_pc_msg);
-      }
-
-      combined_pc_msg->header = aggregator->header;
-      combined_pc_msg->header.frame_id = pointcloud_frame_id_;
-      combined_pointcloud_pub_->publish(std::move(combined_pc_msg));
-
-      auto t_end_combine = std::chrono::high_resolution_clock::now();
-      double combined_publish_ms = std::chrono::duration<double, std::milli>(
-          t_end_combine - t_start_combine).count();
-
-      // Record combined timing
-      {
-        std::lock_guard<std::mutex> lock(timing_data_mutex_);
-        auto it = frame_timing_data_.find(payload.frame_id);
-        if (it != frame_timing_data_.end()) {
-          std::lock_guard<std::mutex> timing_lock(it->second->timing_mutex);
-          it->second->combined_publish_ms = combined_publish_ms;
-
-          // Calculate max cloud time
-          double max_cloud = 0.0;
-          for (const auto& ct : it->second->cloud_times) {
-            max_cloud = std::max(max_cloud, ct.second);
-          }
-          it->second->max_cloud_ms = max_cloud;
-        }
-      }
-
-      {
-        std::lock_guard<std::mutex> lock(aggregator_mutex_);
-        frame_aggregators_.erase(payload.frame_id);
-      }
-    }
-  } else {
-    auto pc_msg = std::make_unique<sensor_msgs::msg::PointCloud2>();
-    pcl::toROSMsg(*transformed_cloud, *pc_msg);
-    pc_msg->header = payload.header;
-    pc_msg->header.frame_id = pointcloud_frame_id_;
-    pointcloud_pubs_[payload.pair_name]->publish(std::move(pc_msg));
   }
 
   // --- HANDLE DEBUG GRID ---
@@ -928,31 +933,6 @@ void DepthEstimation::InitializeCalibrationData() {
 
     calibration_data_[pair_str] = data;
   }
-
-  // Initialize combined pointcloud message template for fast publishing
-  if (publish_combined_pointcloud_ && !calibration_data_.empty()) {
-    const auto &first_pair_data = calibration_data_.at(stereo_pairs_[0]);
-    size_t total_points = stereo_pairs_.size() * first_pair_data.resolution.width * first_pair_data.resolution.height;
-
-    combined_pc_msg_template_.height = 1;
-    combined_pc_msg_template_.width = total_points;
-    combined_pc_msg_template_.is_dense = false;
-    combined_pc_msg_template_.is_bigendian = false;
-
-    // Set up fields (x, y, z) - 12 bytes per point
-    sensor_msgs::msg::PointField field_x, field_y, field_z;
-    field_x.name = "x"; field_x.offset = 0; field_x.datatype = sensor_msgs::msg::PointField::FLOAT32; field_x.count = 1;
-    field_y.name = "y"; field_y.offset = 4; field_y.datatype = sensor_msgs::msg::PointField::FLOAT32; field_y.count = 1;
-    field_z.name = "z"; field_z.offset = 8; field_z.datatype = sensor_msgs::msg::PointField::FLOAT32; field_z.count = 1;
-    combined_pc_msg_template_.fields = {field_x, field_y, field_z};
-    combined_pc_msg_template_.point_step = 12;  // 3 floats * 4 bytes
-    combined_pc_msg_template_.row_step = 12 * total_points;
-    combined_pc_msg_template_.data.resize(combined_pc_msg_template_.row_step);
-
-    combined_msg_initialized_ = true;
-    RCLCPP_INFO(this->get_logger(), "Pre-allocated combined PointCloud2 message for %zu points (%zu bytes)",
-                total_points, combined_pc_msg_template_.row_step);
-  }
 }
 
 void DepthEstimation::InitializePublishers() {
@@ -1081,8 +1061,8 @@ void DepthEstimation::ProcessImage(const cv::Mat &concatenated_image,
     const auto &first_pair_data = calibration_data_.at(stereo_pairs_[0]);
     size_t points_per_pair = first_pair_data.resolution.width * first_pair_data.resolution.height;
 
-    // Create aggregator with pre-allocated cloud
-    auto aggregator = std::make_shared<FrameCloudAggregator>(stereo_pairs_.size(), points_per_pair);
+    // Create aggregator with pre-allocated PointCloud2 buffer (no PCL intermediate)
+    auto aggregator = std::make_shared<FrameCloudAggregator>(stereo_pairs_.size(), points_per_pair, pointcloud_frame_id_);
     aggregator->header = header;
     frame_aggregators_[current_frame_id] = aggregator;
 
@@ -1414,6 +1394,80 @@ DepthEstimation::DisparityToPointCloud(const cv::Mat &disparity_map,
   }
 
   return cloud;
+}
+
+// =============================================================================
+// DIRECT POINTCLOUD2 WRITER (NO PCL INTERMEDIATE)
+// - Writes directly to PointCloud2 buffer (12-byte packed format)
+// - Used for combined mode to skip PCL -> PointCloud2 conversion
+// - Same algorithm as DisparityToPointCloud but outputs to float* buffer
+// =============================================================================
+void DepthEstimation::DisparityToPointCloud2Direct(
+    const cv::Mat &disparity_map,
+    const cv::Mat &K_rect_left,
+    double baseline_meters,
+    double baseline_scale,
+    double offset_factor,
+    const Eigen::Matrix4f &combined_transform,
+    float* output_buffer) {
+
+  // Camera intrinsics
+  const double fx = K_rect_left.at<double>(0, 0);
+  const double fy = K_rect_left.at<double>(1, 1);
+  const double cx = K_rect_left.at<double>(0, 2);
+  const double cy = K_rect_left.at<double>(1, 2);
+
+  // Pre-extract transform components
+  const float r00 = combined_transform(0, 0), r01 = combined_transform(0, 1), r02 = combined_transform(0, 2), t0 = combined_transform(0, 3);
+  const float r10 = combined_transform(1, 0), r11 = combined_transform(1, 1), r12 = combined_transform(1, 2), t1 = combined_transform(1, 3);
+  const float r20 = combined_transform(2, 0), r21 = combined_transform(2, 1), r22 = combined_transform(2, 2), t2 = combined_transform(2, 3);
+
+  // Pre-compute constants
+  const float fx_baseline = static_cast<float>(fx * baseline_meters);
+  const float inv_fx = static_cast<float>(1.0 / fx);
+  const float inv_fy = static_cast<float>(1.0 / fy);
+  const float cx_f = static_cast<float>(cx);
+  const float cy_f = static_cast<float>(cy);
+
+  // Depth correction parameters
+  const float bs = static_cast<float>(baseline_scale);
+  const float of = static_cast<float>(offset_factor);
+
+  const int rows = disparity_map.rows;
+  const int cols = disparity_map.cols;
+
+  // Write directly to output buffer (12 bytes per point: x, y, z)
+  #pragma omp parallel for schedule(static)
+  for (int v = 0; v < rows; ++v) {
+    const float* disp_row = disparity_map.ptr<float>(v);
+    const float v_minus_cy = static_cast<float>(v) - cy_f;
+    const size_t row_offset = v * cols * 3;  // 3 floats per point
+
+    for (int u = 0; u < cols; ++u) {
+      const float disparity = disp_row[u];
+      const size_t idx = row_offset + u * 3;
+
+      if (disparity > 0.5f) {
+        // Compute depth with correction
+        const float Z_raw = fx_baseline / disparity;
+        const float Z = bs * Z_raw / (1.0f + of * Z_raw);
+
+        // Compute X, Y
+        const float u_minus_cx = static_cast<float>(u) - cx_f;
+        const float X = u_minus_cx * Z * inv_fx;
+        const float Y = v_minus_cy * Z * inv_fy;
+
+        // Apply transform and write directly to buffer
+        output_buffer[idx + 0] = r00 * X + r01 * Y + r02 * Z + t0;
+        output_buffer[idx + 1] = r10 * X + r11 * Y + r12 * Z + t1;
+        output_buffer[idx + 2] = r20 * X + r21 * Y + r22 * Z + t2;
+      } else {
+        output_buffer[idx + 0] = std::numeric_limits<float>::quiet_NaN();
+        output_buffer[idx + 1] = std::numeric_limits<float>::quiet_NaN();
+        output_buffer[idx + 2] = std::numeric_limits<float>::quiet_NaN();
+      }
+    }
+  }
 }
 
 void DepthEstimation::InitializeServices() {

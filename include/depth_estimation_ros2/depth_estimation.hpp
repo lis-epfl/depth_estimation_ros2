@@ -5,6 +5,8 @@
 #include <sensor_msgs/msg/compressed_image.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/point_field.hpp>
+#include <std_msgs/msg/header.hpp>
 
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
@@ -82,28 +84,46 @@ struct DisparityPayload {
 };
 
 // Struct for aggregating combined pointcloud per frame
+// OPTIMIZED: Stores PointCloud2 directly instead of PCL cloud to avoid conversion
 struct FrameCloudAggregator {
-    pcl::PointCloud<pcl::PointXYZ>::Ptr combined_cloud;
+    sensor_msgs::msg::PointCloud2 combined_msg;
     std_msgs::msg::Header header;
     std::atomic<int> pairs_received{0};
     std::mutex cloud_mutex;
     size_t points_per_pair;  // Pre-computed: width * height
     size_t num_pairs;
 
-    // Constructor with pre-allocation
-    FrameCloudAggregator(size_t num_pairs_, size_t points_per_pair_)
-        : combined_cloud(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>()),
-          points_per_pair(points_per_pair_),
+    // Constructor with pre-allocation - directly in PointCloud2 format
+    FrameCloudAggregator(size_t num_pairs_, size_t points_per_pair_, const std::string& frame_id)
+        : points_per_pair(points_per_pair_),
           num_pairs(num_pairs_) {
-        // Pre-allocate full size to avoid reallocations
-        combined_cloud->points.resize(num_pairs * points_per_pair);
-        combined_cloud->width = num_pairs * points_per_pair;
-        combined_cloud->height = 1;
-        combined_cloud->is_dense = false;
+        size_t total_points = num_pairs * points_per_pair;
+
+        // Set up PointCloud2 message structure
+        combined_msg.height = 1;
+        combined_msg.width = total_points;
+        combined_msg.is_dense = false;
+        combined_msg.is_bigendian = false;
+        combined_msg.header.frame_id = frame_id;
+
+        // Set up fields (x, y, z) - 12 bytes per point
+        sensor_msgs::msg::PointField field_x, field_y, field_z;
+        field_x.name = "x"; field_x.offset = 0; field_x.datatype = sensor_msgs::msg::PointField::FLOAT32; field_x.count = 1;
+        field_y.name = "y"; field_y.offset = 4; field_y.datatype = sensor_msgs::msg::PointField::FLOAT32; field_y.count = 1;
+        field_z.name = "z"; field_z.offset = 8; field_z.datatype = sensor_msgs::msg::PointField::FLOAT32; field_z.count = 1;
+        combined_msg.fields = {field_x, field_y, field_z};
+        combined_msg.point_step = 12;  // 3 floats * 4 bytes
+        combined_msg.row_step = 12 * total_points;
+        combined_msg.data.resize(combined_msg.row_step);
     }
 
-    FrameCloudAggregator() : combined_cloud(std::make_shared<pcl::PointCloud<pcl::PointXYZ>>()),
-                             points_per_pair(0), num_pairs(0) {}
+    FrameCloudAggregator() : points_per_pair(0), num_pairs(0) {}
+
+    // Get pointer to write directly into the buffer for a specific pair
+    float* GetPairDataPtr(size_t pair_index) {
+        size_t offset_bytes = pair_index * points_per_pair * 12;  // 12 bytes per point
+        return reinterpret_cast<float*>(combined_msg.data.data() + offset_bytes);
+    }
 };
 
 // Struct for tracking async timing per frame
@@ -168,6 +188,15 @@ private:
                         double baseline_scale,
                         double offset_factor,
                         const Eigen::Matrix4f &combined_transform);
+
+  // Direct PointCloud2 writer (skips PCL intermediate for combined mode)
+  void DisparityToPointCloud2Direct(const cv::Mat &disparity_map,
+                                    const cv::Mat &K_rect_left,
+                                    double baseline_meters,
+                                    double baseline_scale,
+                                    double offset_factor,
+                                    const Eigen::Matrix4f &combined_transform,
+                                    float* output_buffer);
 
   // Async pointcloud processing
   void PointcloudWorkerLoop();
@@ -250,10 +279,6 @@ private:
   std::atomic<uint64_t> frame_counter_{0};
   std::map<uint64_t, std::shared_ptr<FrameCloudAggregator>> frame_aggregators_;
   std::mutex aggregator_mutex_;
-
-  // Pre-allocated PointCloud2 template for fast publishing (avoids pcl::toROSMsg overhead)
-  sensor_msgs::msg::PointCloud2 combined_pc_msg_template_;
-  bool combined_msg_initialized_ = false;
 
   // --- Debug Grid (for verbose mode) ---
   std::mutex debug_grid_mutex_;
