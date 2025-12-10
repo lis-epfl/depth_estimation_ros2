@@ -275,6 +275,13 @@ private:
   int num_pointcloud_workers_ = 2;
   static constexpr size_t MAX_QUEUE_SIZE = 16;
 
+  // --- Async Publish Thread (decouples publish latency from processing) ---
+  std::queue<std::unique_ptr<sensor_msgs::msg::PointCloud2>> publish_queue_;
+  std::mutex publish_queue_mutex_;
+  std::condition_variable publish_queue_cv_;
+  std::thread publish_worker_;
+  void PublishWorkerLoop();
+
   // Frame-based aggregation for combined pointcloud
   std::atomic<uint64_t> frame_counter_{0};
   std::map<uint64_t, std::shared_ptr<FrameCloudAggregator>> frame_aggregators_;

@@ -79,6 +79,14 @@ void DepthEstimation::InitializePointcloudWorkers() {
     });
   }
 
+  // Start async publish worker (decouples publish latency from processing)
+  if (publish_combined_pointcloud_) {
+    publish_worker_ = std::thread([this]() {
+      PublishWorkerLoop();
+    });
+    RCLCPP_INFO(this->get_logger(), "Async publish worker started.");
+  }
+
   RCLCPP_INFO(this->get_logger(), "Pointcloud workers started successfully.");
 }
 
@@ -87,6 +95,7 @@ void DepthEstimation::ShutdownPointcloudWorkers() {
 
   shutdown_requested_ = true;
   queue_cv_.notify_all();
+  publish_queue_cv_.notify_all();
 
   for (auto& worker : pointcloud_workers_) {
     if (worker.joinable()) {
@@ -94,8 +103,37 @@ void DepthEstimation::ShutdownPointcloudWorkers() {
     }
   }
 
+  if (publish_worker_.joinable()) {
+    publish_worker_.join();
+  }
+
   pointcloud_workers_.clear();
   RCLCPP_INFO(this->get_logger(), "Pointcloud workers shut down.");
+}
+
+void DepthEstimation::PublishWorkerLoop() {
+  while (!shutdown_requested_) {
+    std::unique_ptr<sensor_msgs::msg::PointCloud2> msg;
+
+    {
+      std::unique_lock<std::mutex> lock(publish_queue_mutex_);
+      publish_queue_cv_.wait(lock, [this]() {
+        return !publish_queue_.empty() || shutdown_requested_;
+      });
+
+      if (shutdown_requested_ && publish_queue_.empty()) {
+        return;
+      }
+
+      msg = std::move(publish_queue_.front());
+      publish_queue_.pop();
+    }
+
+    // Publish happens here - ~40ms serialization is now off the critical path
+    if (msg) {
+      combined_pointcloud_pub_->publish(std::move(msg));
+    }
+  }
 }
 
 void DepthEstimation::PointcloudWorkerLoop() {
@@ -214,9 +252,15 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload& payload) {
       aggregator->combined_msg.header = aggregator->header;
       aggregator->combined_msg.header.frame_id = pointcloud_frame_id_;
 
-      // Just move the pre-filled message - no pcl::toROSMsg needed!
+      // Move message to unique_ptr (should be O(1) - just pointer swap)
       auto msg_to_publish = std::make_unique<sensor_msgs::msg::PointCloud2>(std::move(aggregator->combined_msg));
-      combined_pointcloud_pub_->publish(std::move(msg_to_publish));
+
+      // Queue for async publish (decouples ~40ms serialization from processing)
+      {
+        std::lock_guard<std::mutex> lock(publish_queue_mutex_);
+        publish_queue_.push(std::move(msg_to_publish));
+      }
+      publish_queue_cv_.notify_one();
 
       auto t_end_combine = std::chrono::high_resolution_clock::now();
       double combined_publish_ms = std::chrono::duration<double, std::milli>(
