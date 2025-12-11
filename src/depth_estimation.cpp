@@ -318,7 +318,7 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload &payload) {
 
   // --- VISUALIZATION (if verbose) ---
   cv::Mat display_image;
-  if (payload.verbose) {
+  if (payload.debug_grid) {
     auto t_start_viz = std::chrono::high_resolution_clock::now();
 
     cv::Mat disparity_vis;
@@ -373,7 +373,7 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload &payload) {
   bool should_print_timing = false;
   std::vector<std::pair<std::string, cv::Mat>> images_to_stitch;
 
-  if (payload.verbose && !display_image.empty()) {
+  if (payload.debug_grid && !display_image.empty()) {
     std::lock_guard<std::mutex> lock(debug_grid_mutex_);
     frame_debug_images_[payload.frame_id].push_back(
         {payload.pair_name, display_image.clone()});
@@ -398,7 +398,7 @@ void DepthEstimation::ProcessPointcloudAsync(DisparityPayload &payload) {
   }
 
   // Check if all pairs completed (for timing report when not verbose)
-  if (!payload.verbose) {
+  if (!payload.debug_grid) {
     std::lock_guard<std::mutex> lock(timing_data_mutex_);
     auto it = frame_timing_data_.find(payload.frame_id);
     if (it != frame_timing_data_.end()) {
