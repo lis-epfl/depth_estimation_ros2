@@ -43,7 +43,10 @@ depth_estimation_node:
     # if true then run with nvidia multi-stream; if false run sequentially
     run_parallel: true
 
-    # if true send depth images on ros2 topic and compute time in the terminal
+    # if true send debug image over ros2 topic
+    debug_grid: true
+
+    # if true compute time in the terminal
     verbose: true
 
     # --- NEW: Async Pointcloud Parameters ---

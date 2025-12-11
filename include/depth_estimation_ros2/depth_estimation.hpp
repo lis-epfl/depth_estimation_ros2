@@ -68,7 +68,7 @@ struct DisparityPayload {
     std::string pair_name;
     std_msgs::msg::Header header;
     uint64_t frame_id;
-    bool verbose;  // Whether to generate debug visualization
+    bool debug_grid;  // Whether to generate debug visualization
     size_t pair_index;  // Index of this pair (0-3) for combined cloud offset
 
     // Calibration data (copied for thread safety)
@@ -221,6 +221,7 @@ private:
 
   // --- ROS Parameters ---
   bool verbose_ = false;
+  bool debug_grid_ = false;
   bool run_parallel_ = true;
   bool use_compressed_image_ = true;
   std::string input_image_topic_;
