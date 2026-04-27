@@ -1,7 +1,7 @@
 depth_estimation_node:
   ros__parameters:
     # Subscriber topic for the 4-in-1 concatenated compressed image
-    input_image_topic: "/oak_ffc_4p_driver_node/image_raw/compressed"
+    input_image_topic: "/oak_ffc_4p_driver_node/compressed"
 
     # if true use compressed image
     use_compressed_image: true
