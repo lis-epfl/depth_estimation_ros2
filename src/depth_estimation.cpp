@@ -636,8 +636,14 @@ void DepthEstimation::DeclareRosParameters() {
   this->declare_parameter<bool>("debug_grid", false);
   this->declare_parameter<bool>("run_parallel", true);
   this->declare_parameter<bool>("use_compressed_image", true);
-  this->declare_parameter<std::string>("input_image_topic",
-                                       "/oak_ffc_4p_driver_node/compressed");
+  this->declare_parameter<std::vector<std::string>>(
+      "input_image_topics",
+      {"/oak_ffc_4p_driver_node/CAM_A/compressed",
+       "/oak_ffc_4p_driver_node/CAM_B/compressed",
+       "/oak_ffc_4p_driver_node/CAM_C/compressed",
+       "/oak_ffc_4p_driver_node/CAM_D/compressed"});
+  this->declare_parameter<std::string>("sync_policy", "exact");
+  this->declare_parameter<double>("sync_slop_seconds", 0.005);
 
   this->declare_parameter<std::string>("transform_config_path", "");
   this->declare_parameter<std::string>("onnx_model_path", "model.onnx");
@@ -672,7 +678,9 @@ void DepthEstimation::InitializeRosParameters() {
   this->get_parameter("debug_grid", debug_grid_);
   this->get_parameter("run_parallel", run_parallel_);
   this->get_parameter("use_compressed_image", use_compressed_image_);
-  this->get_parameter("input_image_topic", input_image_topic_);
+  this->get_parameter("input_image_topics", input_image_topics_);
+  this->get_parameter("sync_policy", sync_policy_);
+  this->get_parameter("sync_slop_seconds", sync_slop_seconds_);
 
   this->get_parameter("transform_config_path", transform_config_path_);
   this->get_parameter("onnx_model_path", onnx_model_path_);
@@ -1088,23 +1096,93 @@ void DepthEstimation::InitializePublishers() {
 }
 
 void DepthEstimation::InitializeSubscribers() {
-  auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+  if (input_image_topics_.size() != 4) {
+    RCLCPP_FATAL(this->get_logger(),
+                 "input_image_topics must contain exactly 4 entries (CAM_A..D), "
+                 "got %zu",
+                 input_image_topics_.size());
+    throw std::runtime_error("input_image_topics must have 4 entries");
+  }
+
+  rmw_qos_profile_t qos = rmw_qos_profile_default;
+  qos.depth = 1;
+  qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+  qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+
+  const bool approx = (sync_policy_ == "approx" || sync_policy_ == "approximate");
 
   if (use_compressed_image_) {
-    RCLCPP_INFO(this->get_logger(), "Subscribing to COMPRESSED image topic: %s",
-                input_image_topic_.c_str());
-    compressed_image_sub_ =
-        this->create_subscription<sensor_msgs::msg::CompressedImage>(
-            input_image_topic_, qos,
-            std::bind(&DepthEstimation::CompressedImageCallback, this,
-                      std::placeholders::_1));
+    RCLCPP_INFO(this->get_logger(),
+                "Subscribing (compressed, %s sync) to:",
+                approx ? "approx" : "exact");
+    compressed_image_subs_.clear();
+    for (size_t i = 0; i < 4; ++i) {
+      RCLCPP_INFO(this->get_logger(), "  [%zu] %s", i,
+                  input_image_topics_[i].c_str());
+      auto sub = std::make_shared<
+          message_filters::Subscriber<sensor_msgs::msg::CompressedImage>>();
+      sub->subscribe(this, input_image_topics_[i], qos);
+      compressed_image_subs_.push_back(sub);
+    }
+
+    if (approx) {
+      compressed_approx_sync_ =
+          std::make_shared<message_filters::Synchronizer<CompressedApproxPolicy>>(
+              CompressedApproxPolicy(10), *compressed_image_subs_[0],
+              *compressed_image_subs_[1], *compressed_image_subs_[2],
+              *compressed_image_subs_[3]);
+      compressed_approx_sync_->setMaxIntervalDuration(
+          rclcpp::Duration::from_seconds(sync_slop_seconds_));
+      compressed_approx_sync_->registerCallback(
+          std::bind(&DepthEstimation::CompressedSyncCallback, this,
+                    std::placeholders::_1, std::placeholders::_2,
+                    std::placeholders::_3, std::placeholders::_4));
+    } else {
+      compressed_exact_sync_ =
+          std::make_shared<message_filters::Synchronizer<CompressedExactPolicy>>(
+              CompressedExactPolicy(10), *compressed_image_subs_[0],
+              *compressed_image_subs_[1], *compressed_image_subs_[2],
+              *compressed_image_subs_[3]);
+      compressed_exact_sync_->registerCallback(
+          std::bind(&DepthEstimation::CompressedSyncCallback, this,
+                    std::placeholders::_1, std::placeholders::_2,
+                    std::placeholders::_3, std::placeholders::_4));
+    }
   } else {
-    RCLCPP_INFO(this->get_logger(), "Subscribing to RAW image topic: %s",
-                input_image_topic_.c_str());
-    raw_image_sub_ = this->create_subscription<sensor_msgs::msg::Image>(
-        input_image_topic_, qos,
-        std::bind(&DepthEstimation::RawImageCallback, this,
-                  std::placeholders::_1));
+    RCLCPP_INFO(this->get_logger(),
+                "Subscribing (raw, %s sync) to:",
+                approx ? "approx" : "exact");
+    raw_image_subs_.clear();
+    for (size_t i = 0; i < 4; ++i) {
+      RCLCPP_INFO(this->get_logger(), "  [%zu] %s", i,
+                  input_image_topics_[i].c_str());
+      auto sub = std::make_shared<
+          message_filters::Subscriber<sensor_msgs::msg::Image>>();
+      sub->subscribe(this, input_image_topics_[i], qos);
+      raw_image_subs_.push_back(sub);
+    }
+
+    if (approx) {
+      raw_approx_sync_ =
+          std::make_shared<message_filters::Synchronizer<RawApproxPolicy>>(
+              RawApproxPolicy(10), *raw_image_subs_[0], *raw_image_subs_[1],
+              *raw_image_subs_[2], *raw_image_subs_[3]);
+      raw_approx_sync_->setMaxIntervalDuration(
+          rclcpp::Duration::from_seconds(sync_slop_seconds_));
+      raw_approx_sync_->registerCallback(
+          std::bind(&DepthEstimation::RawSyncCallback, this,
+                    std::placeholders::_1, std::placeholders::_2,
+                    std::placeholders::_3, std::placeholders::_4));
+    } else {
+      raw_exact_sync_ =
+          std::make_shared<message_filters::Synchronizer<RawExactPolicy>>(
+              RawExactPolicy(10), *raw_image_subs_[0], *raw_image_subs_[1],
+              *raw_image_subs_[2], *raw_image_subs_[3]);
+      raw_exact_sync_->registerCallback(
+          std::bind(&DepthEstimation::RawSyncCallback, this,
+                    std::placeholders::_1, std::placeholders::_2,
+                    std::placeholders::_3, std::placeholders::_4));
+    }
   }
 }
 
@@ -1112,44 +1190,78 @@ void DepthEstimation::InitializeSubscribers() {
 // IMAGE CALLBACKS & SHARED PROCESSING
 // --------------------------------------------------------------------------
 
-void DepthEstimation::CompressedImageCallback(
-    const sensor_msgs::msg::CompressedImage::SharedPtr msg) {
+void DepthEstimation::CompressedSyncCallback(
+    const sensor_msgs::msg::CompressedImage::ConstSharedPtr &m0,
+    const sensor_msgs::msg::CompressedImage::ConstSharedPtr &m1,
+    const sensor_msgs::msg::CompressedImage::ConstSharedPtr &m2,
+    const sensor_msgs::msg::CompressedImage::ConstSharedPtr &m3) {
   if (!is_initialized_)
     return;
 
   auto t_start_total = std::chrono::high_resolution_clock::now();
 
-  cv::Mat decoded_image;
-  try {
-    decoded_image = cv::imdecode(cv::Mat(msg->data), cv::IMREAD_COLOR);
-  } catch (const cv::Exception &e) {
-    RCLCPP_ERROR(this->get_logger(), "cv::imdecode error: %s", e.what());
-    return;
+  const std::array<sensor_msgs::msg::CompressedImage::ConstSharedPtr, 4> msgs{
+      m0, m1, m2, m3};
+
+  // Parallel JPEG decode of the 4 streams.
+  std::array<std::future<cv::Mat>, 4> futs;
+  for (size_t i = 0; i < 4; ++i) {
+    futs[i] = std::async(std::launch::async,
+                         [data = msgs[i]->data]() {
+                           return cv::imdecode(cv::Mat(data), cv::IMREAD_COLOR);
+                         });
   }
-  if (decoded_image.empty())
-    return;
+
+  std::vector<cv::Mat> fisheye_images;
+  fisheye_images.reserve(4);
+  for (size_t i = 0; i < 4; ++i) {
+    cv::Mat img;
+    try {
+      img = futs[i].get();
+    } catch (const cv::Exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "cv::imdecode error on cam %zu: %s", i,
+                   e.what());
+      return;
+    }
+    if (img.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Empty decoded image on cam %zu", i);
+      return;
+    }
+    fisheye_images.push_back(std::move(img));
+  }
 
   auto t_end_decode = std::chrono::high_resolution_clock::now();
   double ms_decode =
       std::chrono::duration<double, std::milli>(t_end_decode - t_start_total)
           .count();
 
-  ProcessImage(decoded_image, msg->header, t_start_total, ms_decode);
+  ProcessImage(fisheye_images, m0->header, t_start_total, ms_decode);
 }
 
-void DepthEstimation::RawImageCallback(
-    const sensor_msgs::msg::Image::SharedPtr msg) {
+void DepthEstimation::RawSyncCallback(
+    const sensor_msgs::msg::Image::ConstSharedPtr &m0,
+    const sensor_msgs::msg::Image::ConstSharedPtr &m1,
+    const sensor_msgs::msg::Image::ConstSharedPtr &m2,
+    const sensor_msgs::msg::Image::ConstSharedPtr &m3) {
   if (!is_initialized_)
     return;
 
   auto t_start_total = std::chrono::high_resolution_clock::now();
 
-  cv_bridge::CvImagePtr cv_ptr;
-  try {
-    cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-  } catch (cv_bridge::Exception &e) {
-    RCLCPP_ERROR(this->get_logger(), "cv_bridge exception: %s", e.what());
-    return;
+  const std::array<sensor_msgs::msg::Image::ConstSharedPtr, 4> msgs{m0, m1, m2,
+                                                                    m3};
+  std::vector<cv::Mat> fisheye_images;
+  fisheye_images.reserve(4);
+  for (size_t i = 0; i < 4; ++i) {
+    cv_bridge::CvImagePtr cv_ptr;
+    try {
+      cv_ptr = cv_bridge::toCvCopy(msgs[i], sensor_msgs::image_encodings::BGR8);
+    } catch (cv_bridge::Exception &e) {
+      RCLCPP_ERROR(this->get_logger(), "cv_bridge exception on cam %zu: %s", i,
+                   e.what());
+      return;
+    }
+    fisheye_images.push_back(cv_ptr->image);
   }
 
   auto t_end_convert = std::chrono::high_resolution_clock::now();
@@ -1157,17 +1269,25 @@ void DepthEstimation::RawImageCallback(
       std::chrono::duration<double, std::milli>(t_end_convert - t_start_total)
           .count();
 
-  ProcessImage(cv_ptr->image, msg->header, t_start_total, ms_convert);
+  ProcessImage(fisheye_images, m0->header, t_start_total, ms_convert);
 }
 
 // --- CORE FUNCTION (INFERENCE ONLY - NO BLOCKING) ---
 void DepthEstimation::ProcessImage(
-    const cv::Mat &concatenated_image, const std_msgs::msg::Header &header,
+    const std::vector<cv::Mat> &fisheye_images,
+    const std_msgs::msg::Header &header,
     const std::chrono::high_resolution_clock::time_point &t_start_total,
     double preprocessing_ms) {
 
+  if (fisheye_images.size() != 4) {
+    RCLCPP_ERROR(this->get_logger(),
+                 "ProcessImage expected 4 fisheye images, got %zu",
+                 fisheye_images.size());
+    return;
+  }
+
   if (fisheye_image_width_ == 0) {
-    fisheye_image_width_ = concatenated_image.cols / 4;
+    fisheye_image_width_ = fisheye_images[0].cols;
   }
 
   // Get frame ID for this image
@@ -1224,13 +1344,7 @@ void DepthEstimation::ProcessImage(
     }
   }
 
-  // 1. SPLIT
-  std::vector<cv::Mat> fisheye_images;
-  for (int i = 0; i < 4; ++i) {
-    fisheye_images.push_back(concatenated_image(
-        cv::Rect(i * fisheye_image_width_, 0, fisheye_image_width_,
-                 concatenated_image.rows)));
-  }
+  // 1. (SPLIT no longer needed — fisheye_images already arrived as 4 separate cams.)
 
   // Define the worker function - ONLY rectify + inference, then queue
   auto process_pair_task = [&](const std::string &pair_str, int s_idx,

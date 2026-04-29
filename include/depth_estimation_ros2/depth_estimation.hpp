@@ -11,6 +11,11 @@
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/opencv.hpp>
 
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/sync_policies/exact_time.h>
+#include <message_filters/sync_policies/approximate_time.h>
+
 #include <Eigen/Dense>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
@@ -166,11 +171,20 @@ private:
   void ShutdownPointcloudWorkers();
 
   // --- Core Logic & Callbacks ---
-  void CompressedImageCallback(const sensor_msgs::msg::CompressedImage::SharedPtr msg);
-  void RawImageCallback(const sensor_msgs::msg::Image::SharedPtr msg);
+  // Synchronized 4-camera callbacks (one per cam: A, B, C, D in stereo-pair index order)
+  void CompressedSyncCallback(
+      const sensor_msgs::msg::CompressedImage::ConstSharedPtr &m0,
+      const sensor_msgs::msg::CompressedImage::ConstSharedPtr &m1,
+      const sensor_msgs::msg::CompressedImage::ConstSharedPtr &m2,
+      const sensor_msgs::msg::CompressedImage::ConstSharedPtr &m3);
+  void RawSyncCallback(
+      const sensor_msgs::msg::Image::ConstSharedPtr &m0,
+      const sensor_msgs::msg::Image::ConstSharedPtr &m1,
+      const sensor_msgs::msg::Image::ConstSharedPtr &m2,
+      const sensor_msgs::msg::Image::ConstSharedPtr &m3);
 
-  // Core Processing Function
-  void ProcessImage(const cv::Mat &concatenated_image,
+  // Core Processing Function — receives 4 already-split per-cam images
+  void ProcessImage(const std::vector<cv::Mat> &fisheye_images,
                     const std_msgs::msg::Header &header,
                     const std::chrono::high_resolution_clock::time_point &t_start_total,
                     double preprocessing_ms);
@@ -224,7 +238,11 @@ private:
   bool debug_grid_ = false;
   bool run_parallel_ = true;
   bool use_compressed_image_ = true;
-  std::string input_image_topic_;
+  // 4 per-camera topics, in stereo-pair index order (CAM_A, CAM_B, CAM_C, CAM_D).
+  std::vector<std::string> input_image_topics_;
+  // Sync policy: "exact" (default — driver stamps all 4 with same time) or "approx".
+  std::string sync_policy_;
+  double sync_slop_seconds_ = 0.005;
   std::string transform_config_path_;
   std::string onnx_model_path_;
   std::string model_type_;
@@ -297,8 +315,35 @@ private:
   std::mutex timing_data_mutex_;
 
   // --- ROS Communication ---
-  rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_image_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr raw_image_sub_;
+  // 4 message_filters subscribers (per-cam) plus a synchronizer.
+  std::vector<std::shared_ptr<
+      message_filters::Subscriber<sensor_msgs::msg::CompressedImage>>>
+      compressed_image_subs_;
+  std::vector<std::shared_ptr<
+      message_filters::Subscriber<sensor_msgs::msg::Image>>>
+      raw_image_subs_;
+
+  using CompressedExactPolicy = message_filters::sync_policies::ExactTime<
+      sensor_msgs::msg::CompressedImage, sensor_msgs::msg::CompressedImage,
+      sensor_msgs::msg::CompressedImage, sensor_msgs::msg::CompressedImage>;
+  using CompressedApproxPolicy = message_filters::sync_policies::ApproximateTime<
+      sensor_msgs::msg::CompressedImage, sensor_msgs::msg::CompressedImage,
+      sensor_msgs::msg::CompressedImage, sensor_msgs::msg::CompressedImage>;
+  using RawExactPolicy = message_filters::sync_policies::ExactTime<
+      sensor_msgs::msg::Image, sensor_msgs::msg::Image,
+      sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
+  using RawApproxPolicy = message_filters::sync_policies::ApproximateTime<
+      sensor_msgs::msg::Image, sensor_msgs::msg::Image,
+      sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
+
+  std::shared_ptr<message_filters::Synchronizer<CompressedExactPolicy>>
+      compressed_exact_sync_;
+  std::shared_ptr<message_filters::Synchronizer<CompressedApproxPolicy>>
+      compressed_approx_sync_;
+  std::shared_ptr<message_filters::Synchronizer<RawExactPolicy>>
+      raw_exact_sync_;
+  std::shared_ptr<message_filters::Synchronizer<RawApproxPolicy>>
+      raw_approx_sync_;
 
   std::map<std::string,
            rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr>

@@ -1,7 +1,18 @@
 depth_estimation_node:
   ros__parameters:
-    # Subscriber topic for the 4-in-1 concatenated compressed image
-    input_image_topic: "/oak_ffc_4p_driver_node/compressed"
+    # 4 per-camera input topics, in stereo-pair index order (CAM_A, CAM_B, CAM_C, CAM_D).
+    # Either CompressedImage (if use_compressed_image: true) or Image.
+    input_image_topics:
+      - "/oak_ffc_4p_driver_node/CAM_A/compressed"
+      - "/oak_ffc_4p_driver_node/CAM_B/compressed"
+      - "/oak_ffc_4p_driver_node/CAM_C/compressed"
+      - "/oak_ffc_4p_driver_node/CAM_D/compressed"
+
+    # message_filters sync policy: "exact" (driver publishes all 4 with the
+    # same timestamp from one OAK MessageGroup, so this works) or "approx".
+    sync_policy: "exact"
+    # Slop for approximate sync, in seconds. Ignored when sync_policy == "exact".
+    sync_slop_seconds: 0.005
 
     # if true use compressed image
     use_compressed_image: true

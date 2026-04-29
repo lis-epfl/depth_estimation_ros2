@@ -9,6 +9,7 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(message_filters REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -56,6 +57,7 @@ ament_target_dependencies(depth_estimation_node
   rclcpp
   rclcpp_components
   sensor_msgs
+  message_filters
   cv_bridge
   pcl_conversions
   geometry_msgs
